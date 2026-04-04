@@ -6,6 +6,10 @@ WifiManager::WifiManager(const Config& config) : _cfg(config), _server(80) {}
 void WifiManager::begin(const char* apPrefix) {
   _apPrefix = String(apPrefix == nullptr ? "DrowsySetup" : apPrefix);
   _lastConnectedMs = millis();
+  _wifiState = WIFI_DISCONNECTED;
+  _wifiBackoffMs = WIFI_BACKOFF_MIN_MS;
+  _nextWifiRetryMs = 0;
+  _lastInternetCheckMs = 0;
 
   WiFi.mode(WIFI_STA);
   // FIX: keep credentials persistent for roaming/reconnect stability.
@@ -36,26 +40,49 @@ void WifiManager::tick(uint32_t nowMs) {
 
   wl_status_t st = WiFi.status();
   if (st == WL_CONNECTED) {
-    if (!_wasConnected) {
+    if (_wifiState != WIFI_CONNECTED) {
+      Serial.println("[WIFI] CONNECTED");
       _lastConnectedMs = nowMs;
-      _connecting = false;
+      _wifiState = WIFI_CONNECTED;
+      _wifiBackoffMs = WIFI_BACKOFF_MIN_MS;
+      _nextWifiRetryMs = nowMs;
+      _wifiConnectStartMs = 0;
       if (_portalRunning) {
         stopPortal();
       }
     }
     _wasConnected = true;
+
+    if ((nowMs - _lastInternetCheckMs) >= _cfg.internetCheckIntervalMs) {
+      _lastInternetCheckMs = nowMs;
+      // FIX: detect fake connected state with lightweight internet probe.
+      if (!hasInternet()) {
+        Serial.println("[WIFI] LOST");
+        WiFi.disconnect(false, false);
+        _wifiState = WIFI_DISCONNECTED;
+        _nextWifiRetryMs = nowMs;
+      }
+    }
     return;
+  }
+
+  if (_wifiState == WIFI_CONNECTED) {
+    Serial.println("[WIFI] LOST");
+    _wifiState = WIFI_DISCONNECTED;
+    _nextWifiRetryMs = nowMs;
   }
 
   _wasConnected = false;
 
-  if (_connecting && (nowMs - _connectSinceMs) >= _cfg.connectTimeoutMs) {
-    WiFi.disconnect(false, false);
-    _connecting = false;
-    _nextConnectTryMs = nowMs + _cfg.retryIntervalMs;
+  if (_wifiState == WIFI_CONNECTING && (nowMs - _wifiConnectStartMs) > _cfg.connectTimeoutMs) {
+    // CRITICAL: break stuck CONNECTING state with timeout.
+    Serial.println("[WIFI] TIMEOUT");
+    WiFi.disconnect(true, false);
+    _wifiState = WIFI_DISCONNECTED;
+    _nextWifiRetryMs = nowMs + _wifiBackoffMs;
   }
 
-  if (!_connecting && hasCredentials() && nowMs >= _nextConnectTryMs) {
+  if (_wifiState == WIFI_DISCONNECTED && hasCredentials() && nowMs >= _nextWifiRetryMs) {
     beginConnect(nowMs);
   }
 
@@ -69,7 +96,9 @@ void WifiManager::tick(uint32_t nowMs) {
   }
 }
 
-bool WifiManager::isConnected() const { return WiFi.status() == WL_CONNECTED; }
+bool WifiManager::isConnected() const {
+  return _wifiState == WIFI_CONNECTED && WiFi.status() == WL_CONNECTED;
+}
 
 bool WifiManager::hasCredentials() const { return _ssid.length() > 0; }
 
@@ -87,8 +116,10 @@ void WifiManager::clearCredentials() {
     _prefs.remove("pass");
   }
   WiFi.disconnect(false, true);
-  _connecting = false;
-  _nextConnectTryMs = millis() + _cfg.retryIntervalMs;
+  _wifiState = WIFI_DISCONNECTED;
+  _wifiConnectStartMs = 0;
+  _wifiBackoffMs = WIFI_BACKOFF_MIN_MS;
+  _nextWifiRetryMs = millis() + _wifiBackoffMs;
   startPortal();
 }
 
@@ -110,14 +141,28 @@ void WifiManager::beginConnect(uint32_t nowMs) {
   if (!hasCredentials()) return;
 
   WiFi.mode(_portalRunning ? WIFI_AP_STA : WIFI_STA);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   // CRITICAL: enforce no WiFi power save during reconnection cycles.
   esp_wifi_set_ps(WIFI_PS_NONE);
+  Serial.println("[WIFI] CONNECTING");
   WiFi.begin(_ssid.c_str(), _password.c_str());
 
-  _connecting = true;
-  _connectSinceMs = nowMs;
-  _nextConnectTryMs = nowMs + _cfg.retryIntervalMs;
+  _wifiState = WIFI_CONNECTING;
+  _wifiConnectStartMs = nowMs;
+  _nextWifiRetryMs = nowMs + _wifiBackoffMs;
+  _wifiBackoffMs = min(_wifiBackoffMs * 2U, WIFI_BACKOFF_MAX_MS);
+}
+
+bool WifiManager::hasInternet() {
+  WiFiClient client;
+  client.setTimeout(120);
+  const bool ok = client.connect("8.8.8.8", 53);
+  if (ok) {
+    client.stop();
+  }
+  return ok;
 }
 
 void WifiManager::startPortal() {

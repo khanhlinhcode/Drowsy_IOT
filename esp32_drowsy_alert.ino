@@ -6,7 +6,8 @@
 
 #include "motion_detector.h"
 #include "wifi_manager.h"
-
+WifiManager gWifiManager;
+MotionDetector gMotionDetector;
 // ============================================================
 // Configuration
 // ============================================================
@@ -907,9 +908,14 @@ void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
 
 void ensureMqtt(uint32_t nowMs) {
   if (!gWifiManager.isConnected()) {
+    // FIX: force MQTT reset immediately when WiFi is not in connected state.
+    if (gMqtt.connected()) {
+      gMqtt.disconnect();
+    }
     gMqttUp = false;
     gMqttSubscribed = false;
     gFirstPacketReceived = false;
+    gNeedSyncAfterReconnect = true;
     return;
   }
 

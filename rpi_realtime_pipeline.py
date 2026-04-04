@@ -33,6 +33,10 @@ from typing import Optional, Tuple, Union
 import cv2
 import numpy as np
 import paho.mqtt.client as mqtt
+import os
+import resource
+import psutil  # pip install psutil
+
 
 SIG_SAFE = 0
 SIG_TIRED = 1
@@ -71,7 +75,14 @@ def clamp100(v: int) -> int:
     if v > 100:
         return 100
     return int(v)
+_rate_limit_cache = {}
 
+def rate_limited_log(log, level: str, key: str, msg: str, interval_ms: int = 2000):
+    now = monotonic_ms()
+    last = _rate_limit_cache.get(key, 0)
+    if (now - last) > interval_ms:
+        _rate_limit_cache[key] = now
+        getattr(log, level)(msg)
 
 @dataclass(frozen=True)
 class MqttConfig:
@@ -181,9 +192,14 @@ class FrameGrabber:
         self._latest: Optional[FramePacket] = None
         self._last_open_try_ms = 0
 
+        self._reopen_requested = False
+
         self._cap_count = 0
         self._cap_mark_ms = monotonic_ms()
         self._cap_fps = 0.0
+    def request_reopen(self):
+        with self._lock:
+            self._reopen_requested = True
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -265,6 +281,17 @@ class FrameGrabber:
     def _run(self) -> None:
         fail_count = 0
         while not self._stop.is_set():
+            with self._lock:
+                reopen_now = self._reopen_requested
+                if reopen_now:
+                    self._reopen_requested = False
+
+            if reopen_now:
+                self._log.warning("[CAM] forced reopen requested")
+                self._close()
+                time.sleep(0.1)
+                continue
+
             if self._cap is None:
                 self._open()
                 if self._cap is None:
@@ -987,6 +1014,8 @@ class RealtimePipeline:
         self._confirm_since_ms = monotonic_ms()
         self._confirm_hold_ms = 180
 
+        self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+
     def start(self) -> None:
         self._camera.start()
         self._mqtt.start()
@@ -996,6 +1025,7 @@ class RealtimePipeline:
         self._state_thread = threading.Thread(target=self._state_engine_loop, name="state-thread", daemon=True)
         self._infer_thread.start()
         self._state_thread.start()
+        self._watchdog.start()
         self._log.info("Pipeline started")
 
     def stop(self) -> None:
@@ -1038,12 +1068,25 @@ class RealtimePipeline:
 
             frame_age = now - packet.ts_ms
             if frame_age > self._cfg.stale_frame_ms:
-                # CRITICAL: drop stale frames (>200ms) to avoid delayed decisions.
+                stale_streak = getattr(self, "_stale_streak", 0) + 1
+                self._stale_streak = stale_streak
+
+                if stale_streak % 10 == 0:
+                    rate_limited_log(self._log, "warning", "stale_frame", f"[CAM] stale x{stale_streak} age={frame_age}ms")
+
+                if stale_streak >= 15:
+                    self._log.error("[CAM] forcing camera reopen")
+                    self._camera.request_reopen()
+                    self._stale_streak = 0
+
                 with self._state_lock:
                     self._frames_seen += 1
                     self._dropped_frames += 1
+
                 time.sleep(0.002)
                 continue
+
+            self._stale_streak = 0
 
             if packet.ts_ms == last_frame_ts:
                 time.sleep(0.001)
@@ -1188,6 +1231,9 @@ class RealtimePipeline:
                 self._persist.resolve(SIG_SAFE, smooth.fatigue, now)
 
             total_latency = max(0, now - pkt.capture_ts_ms)
+            if total_latency > self._cfg.stale_frame_ms:
+                rate_limited_log(self._log, "warning", "latency_drop", f"[STATE] drop latency={total_latency}ms")
+                continue
             with self._state_lock:
                 self._latency_sum_ms += float(total_latency)
                 self._latency_count += 1
@@ -1213,6 +1259,24 @@ class RealtimePipeline:
                 self._render_counter += 1
                 if (self._render_counter % max(1, self._cfg.render_every_n)) == 0:
                     self._render_preview(final_signal)
+    def _watchdog_loop(self):
+        while not self._stop.is_set():
+            fps = self._camera.capture_fps()
+
+            if fps < 5:
+                rate_limited_log(self._log, "warning", "low_fps", "[WATCHDOG] low camera fps")
+                self._camera.request_reopen()
+
+            if not self._mqtt.is_connected():
+                rate_limited_log(self._log, "warning", "mqtt_down", "[WATCHDOG] MQTT disconnected")
+
+            process = psutil.Process(os.getpid())
+            mem_mb = process.memory_info().rss / (1024 * 1024)
+
+            if mem_mb > 500:
+                rate_limited_log(self._log, "warning", "mem", f"[WATCHDOG] memory high {mem_mb:.1f}MB")
+
+            time.sleep(2)
 
     def _safe_analyze(self, frame: np.ndarray, now_ms: int) -> RawRisk:
         try:
@@ -1272,35 +1336,19 @@ class RealtimePipeline:
             infer_cost_ms = self._last_infer_cost_ms
 
         if smooth is None:
-            self._log.info(
-                "[PIPELINE] sig=%d(%s) infer_fps=%.1f cap_fps=%.1f frame_age=%dms infer_cost=%dms interval=%dms pub_rate=%.2f",
-                sig,
-                STATUS_TEXT.get(sig, "ATTENTIVE"),
-                self._infer_fps,
-                self._camera.capture_fps(),
-                frame_age_ms,
-                infer_cost_ms,
-                self._infer_interval_ms,
-                self._mqtt.publish_rate_hz(),
+            rate_limited_log(
+                self._log,
+                "info",
+                "pipeline_log",
+                f"[PIPELINE] sig={sig}({STATUS_TEXT.get(sig, 'ATTENTIVE')}) infer_fps={self._infer_fps:.1f} cap_fps={self._camera.capture_fps():.1f} frame_age={frame_age_ms}ms infer_cost={infer_cost_ms}ms interval={self._infer_interval_ms}ms pub_rate={self._mqtt.publish_rate_hz():.2f}"
             )
             return
 
-        self._log.info(
-            "[PIPELINE] sig=%d(%s) fatigue=%d conf=%.2f safe=%.2f tired=%.2f sleepy=%.2f sleep=%.2f infer_fps=%.1f cap_fps=%.1f frame_age=%dms infer_cost=%dms interval=%dms pub_rate=%.2f",
-            sig,
-            STATUS_TEXT.get(sig, "ATTENTIVE"),
-            smooth.fatigue,
-            smooth.confidence,
-            smooth.ratio_safe,
-            smooth.ratio_tired,
-            smooth.ratio_sleepy,
-            smooth.ratio_sleep,
-            self._infer_fps,
-            self._camera.capture_fps(),
-            frame_age_ms,
-            infer_cost_ms,
-            self._infer_interval_ms,
-            self._mqtt.publish_rate_hz(),
+        rate_limited_log(
+            self._log,
+            "info",
+            "pipeline_log",
+            f"[PIPELINE] sig={sig}({STATUS_TEXT.get(sig, 'ATTENTIVE')}) fatigue={smooth.fatigue} conf={smooth.confidence:.2f} safe={smooth.ratio_safe:.2f} tired={smooth.ratio_tired:.2f} sleepy={smooth.ratio_sleepy:.2f} sleep={smooth.ratio_sleep:.2f} infer_fps={self._infer_fps:.1f} cap_fps={self._camera.capture_fps():.1f} frame_age={frame_age_ms}ms infer_cost={infer_cost_ms}ms interval={self._infer_interval_ms}ms pub_rate={self._mqtt.publish_rate_hz():.2f}"
         )
 
         if self._metrics_file and (now_ms - self._last_metrics_dump_ms) >= 300:
@@ -1428,5 +1476,13 @@ def main() -> None:
     pipeline.run_forever()
 
 
+def run_with_restart():
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print("[FATAL] restarting:", e)
+            time.sleep(2)
+
 if __name__ == "__main__":
-    main()
+    run_with_restart()
