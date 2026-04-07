@@ -177,6 +177,8 @@ void WifiManager::beginConnect(uint32_t nowMs) {
 
 void WifiManager::emitPiWifiCredentials() {
   if (!hasCredentials()) return;
+  // NOTE: credentials are sent over local serial for Pi auto-provisioning.
+  // Deploy only in trusted physical environments.
   StaticJsonDocument<256> doc;
   doc["type"] = "wifi_credentials";
   doc["ssid"] = _ssid;

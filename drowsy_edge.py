@@ -166,9 +166,9 @@ def _get_pi_ip(interface):
     try:
         res = _run_cmd(["ip", "-4", "-o", "addr", "show", "dev", interface], timeout=8)
         if res.returncode == 0:
-            line = (res.stdout or "").strip().splitlines()
-            if line:
-                parts = line[0].split()
+            lines = (res.stdout or "").strip().splitlines()
+            if lines:
+                parts = lines[0].split()
                 if len(parts) >= 4 and "/" in parts[3]:
                     return parts[3].split("/", 1)[0]
     except Exception:
@@ -243,7 +243,7 @@ def _handle_esp32_wifi_sync_line(line):
     if msg_type == "wifi_credentials":
         _connect_pi_wifi(
             str(data.get("ssid", "")).strip(),
-            str(data.get("pass", "")),
+            str(data.get("pass", "")).strip(),
             PI_WIFI_INTERFACE,
         )
     elif msg_type == "wifi_connected":
