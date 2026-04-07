@@ -13,6 +13,9 @@ import argparse
 import json
 import math
 import os
+import select
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -77,6 +80,10 @@ MQTT_META_MIN_MS = 100
 MQTT_RETRY_BASE_MS = 500
 MQTT_RETRY_MAX_MS = 8000
 
+ESP32_WIFI_SERIAL_PORT = os.getenv("ESP32_WIFI_SERIAL_PORT", "/dev/ttyUSB0")
+ESP32_WIFI_SERIAL_BAUD = int(os.getenv("ESP32_WIFI_SERIAL_BAUD", "115200"))
+PI_WIFI_INTERFACE = os.getenv("PI_WIFI_INTERFACE", "wlan0")
+
 mqtt_client = None
 _mqtt_connected = False
 _mqtt_force_sync = True
@@ -90,6 +97,8 @@ _mqtt_retry_ms = MQTT_RETRY_BASE_MS
 _mqtt_next_retry_ms = 0
 
 _mqtt_pub_lock = threading.Lock()
+_wifi_sync_last_signature = ""
+_wifi_sync_last_attempt_ms = 0
 
 
 def _on_mqtt_connect(_client, _userdata, _flags, rc, *_args):
@@ -133,6 +142,145 @@ def _init_mqtt():
         print(f"MQTT init broker={MQTT_BROKER}:{MQTT_PORT}")
     except Exception as exc:
         print("MQTT connection failed:", exc)
+
+
+def _run_cmd(cmd, timeout=25):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def _get_pi_ip(interface):
+    try:
+        res = _run_cmd(["ip", "-4", "-o", "addr", "show", "dev", interface], timeout=8)
+        if res.returncode == 0:
+            line = (res.stdout or "").strip().splitlines()
+            if line:
+                parts = line[0].split()
+                if len(parts) >= 4 and "/" in parts[3]:
+                    return parts[3].split("/", 1)[0]
+    except Exception:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return ""
+
+
+def _connect_pi_wifi(ssid, password, interface):
+    global _wifi_sync_last_signature, _wifi_sync_last_attempt_ms
+    now_ms = int(time.monotonic() * 1000)
+    signature = f"{ssid}\n{password}\n{interface}"
+    if signature == _wifi_sync_last_signature and (now_ms - _wifi_sync_last_attempt_ms) < 15000:
+        return
+
+    _wifi_sync_last_signature = signature
+    _wifi_sync_last_attempt_ms = now_ms
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return
+
+    print(f"[WIFI_SYNC] request ssid='{ssid}' iface={interface}")
+    cmd = ["nmcli", "--wait", "20", "dev", "wifi", "connect", ssid, "ifname", interface]
+    if password:
+        cmd.extend(["password", password])
+
+    try:
+        res = _run_cmd(cmd, timeout=35)
+        if res.returncode != 0:
+            stderr = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            detail = stderr if stderr else stdout
+            if detail:
+                print(f"[WIFI_SYNC] Pi WiFi connect failed: {detail}")
+            else:
+                print("[WIFI_SYNC] Pi WiFi connect failed")
+            return
+
+        pi_ip = _get_pi_ip(interface)
+        if pi_ip:
+            print(f"[WIFI_SYNC] Pi WiFi connected: ssid='{ssid}' ip={pi_ip}")
+        else:
+            print(f"[WIFI_SYNC] Pi WiFi connected: ssid='{ssid}' ip=unknown")
+    except Exception as exc:
+        print(f"[WIFI_SYNC] Pi WiFi connect error: {exc}")
+
+
+def _handle_esp32_wifi_sync_line(line):
+    prefix = "[ESP32_WIFI] "
+    if not line.startswith(prefix):
+        return
+    raw = line[len(prefix):].strip()
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return
+
+    msg_type = str(data.get("type", "")).strip().lower()
+    if msg_type == "wifi_credentials":
+        _connect_pi_wifi(
+            str(data.get("ssid", "")).strip(),
+            str(data.get("pass", "")),
+            PI_WIFI_INTERFACE,
+        )
+    elif msg_type == "wifi_connected":
+        esp_ip = str(data.get("esp_ip", "")).strip()
+        ssid = str(data.get("ssid", "")).strip()
+        if esp_ip:
+            print(f"[WIFI_SYNC] ESP32 connected: ssid='{ssid}' esp_ip={esp_ip}")
+
+
+def _esp32_wifi_sync_worker():
+    serial_path = ESP32_WIFI_SERIAL_PORT
+    if not serial_path:
+        return
+
+    while not _stop_event.is_set():
+        fd = -1
+        try:
+            _run_cmd(
+                [
+                    "stty",
+                    "-F",
+                    serial_path,
+                    str(ESP32_WIFI_SERIAL_BAUD),
+                    "cs8",
+                    "-cstopb",
+                    "-parenb",
+                    "-icanon",
+                    "-echo",
+                    "min",
+                    "0",
+                    "time",
+                    "1",
+                ],
+                timeout=8,
+            )
+            fd = os.open(serial_path, os.O_RDONLY | os.O_NONBLOCK)
+            print(f"[WIFI_SYNC] listening {serial_path}@{ESP32_WIFI_SERIAL_BAUD}")
+            buf = ""
+            while not _stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 512)
+                if not chunk:
+                    continue
+                buf += chunk.decode("utf-8", errors="ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    _handle_esp32_wifi_sync_line(line.strip())
+        except Exception:
+            _stop_event.wait(2.0)
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
 
 
 # NOTE: _init_mqtt() is called from main() after CLI args are parsed.
@@ -1937,6 +2085,7 @@ def _headless_loop():
 
 def main():
     global MQTT_BROKER, MQTT_PORT
+    global ESP32_WIFI_SERIAL_PORT, ESP32_WIFI_SERIAL_BAUD, PI_WIFI_INTERFACE
     global USB_CAMERA_SOURCE, USB_CAMERA_WIDTH, USB_CAMERA_HEIGHT, USB_CAMERA_FPS
 
     parser = argparse.ArgumentParser(description="Drowsiness Edge Detection — RPi4 + ESP32")
@@ -1946,6 +2095,9 @@ def main():
     parser.add_argument("--width", type=int, default=224, help="Frame width (default: 224)")
     parser.add_argument("--height", type=int, default=168, help="Frame height (default: 168)")
     parser.add_argument("--fps", type=int, default=30, help="Camera FPS target (default: 30)")
+    parser.add_argument("--esp32-serial", default=None, help="ESP32 serial device for WiFi sync (default: /dev/ttyUSB0)")
+    parser.add_argument("--esp32-baud", type=int, default=None, help="ESP32 serial baud for WiFi sync (default: 115200)")
+    parser.add_argument("--pi-wifi-iface", default=None, help="Pi WiFi interface for nmcli connect (default: wlan0)")
     parser.add_argument("--no-preview", dest="preview", action="store_false", default=True,
                         help="Disable preview window (headless mode)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -1960,6 +2112,12 @@ def main():
         MQTT_BROKER = args.mqtt_host
     if args.mqtt_port is not None:
         MQTT_PORT = args.mqtt_port
+    if args.esp32_serial is not None:
+        ESP32_WIFI_SERIAL_PORT = args.esp32_serial
+    if args.esp32_baud is not None and args.esp32_baud > 0:
+        ESP32_WIFI_SERIAL_BAUD = args.esp32_baud
+    if args.pi_wifi_iface is not None:
+        PI_WIFI_INTERFACE = args.pi_wifi_iface
 
     # Init MQTT after CLI args are applied
     _init_mqtt()
@@ -1975,6 +2133,7 @@ def main():
         f"target={USB_CAMERA_WIDTH}x{USB_CAMERA_HEIGHT}@{USB_CAMERA_FPS}"
     )
     print(f"MQTT broker={MQTT_BROKER}:{MQTT_PORT}")
+    print(f"WiFi sync serial={ESP32_WIFI_SERIAL_PORT}@{ESP32_WIFI_SERIAL_BAUD} iface={PI_WIFI_INTERFACE}")
     print(f"Preview={'ON' if args.preview else 'OFF (headless)'}")
 
     try:
@@ -1998,9 +2157,11 @@ def main():
     )
     proc_thread = threading.Thread(target=_processing_worker, name="processor", daemon=True)
     mqtt_thread = threading.Thread(target=_mqtt_reconnect_worker, name="mqtt-reconnect", daemon=True)
+    wifi_sync_thread = threading.Thread(target=_esp32_wifi_sync_worker, name="wifi-sync", daemon=True)
     cam_thread.start()
     proc_thread.start()
     mqtt_thread.start()
+    wifi_sync_thread.start()
 
     try:
         if args.preview:
@@ -2014,6 +2175,7 @@ def main():
         cam_thread.join(timeout=1.5)
         proc_thread.join(timeout=1.5)
         mqtt_thread.join(timeout=1.0)
+        wifi_sync_thread.join(timeout=1.0)
 
         # Send SAFE signal to ESP32 before disconnecting
         try:

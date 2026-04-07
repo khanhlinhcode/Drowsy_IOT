@@ -92,6 +92,8 @@ private:
   void startPortal();
   void stopPortal();
   void setupRoutes();
+  void emitPiWifiCredentials();
+  void emitPiWifiConnected();
 
   void handleRoot();
   void handleSave();

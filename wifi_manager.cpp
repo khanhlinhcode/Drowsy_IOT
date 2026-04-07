@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include <ArduinoJson.h>
 #include <esp_wifi.h>
 
 WifiManager::WifiManager(const Config& config) : _cfg(config), _server(80) {}
@@ -45,6 +46,7 @@ void WifiManager::tick(uint32_t nowMs) {
   if (st == WL_CONNECTED) {
     if (_wifiState != WIFI_CONNECTED) {
       Serial.println("[WIFI] CONNECTED");
+      emitPiWifiConnected();
       _lastConnectedMs = nowMs;
       _wifiState = WIFI_CONNECTED;
       _wifiBackoffMs = WIFI_BACKOFF_MIN_MS;
@@ -156,6 +158,7 @@ void WifiManager::saveCredentials(const String& ssid, const String& password) {
 
 void WifiManager::beginConnect(uint32_t nowMs) {
   if (!hasCredentials()) return;
+  emitPiWifiCredentials();
 
   WiFi.mode(_portalRunning ? WIFI_AP_STA : WIFI_STA);
   WiFi.persistent(true);
@@ -170,6 +173,29 @@ void WifiManager::beginConnect(uint32_t nowMs) {
   _wifiConnectStartMs = nowMs;
   _nextWifiRetryMs = nowMs + _wifiBackoffMs;
   _wifiBackoffMs = min(_wifiBackoffMs * 2U, WIFI_BACKOFF_MAX_MS);
+}
+
+void WifiManager::emitPiWifiCredentials() {
+  if (!hasCredentials()) return;
+  StaticJsonDocument<256> doc;
+  doc["type"] = "wifi_credentials";
+  doc["ssid"] = _ssid;
+  doc["pass"] = _password;
+  String payload;
+  serializeJson(doc, payload);
+  Serial.print("[ESP32_WIFI] ");
+  Serial.println(payload);
+}
+
+void WifiManager::emitPiWifiConnected() {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "wifi_connected";
+  doc["ssid"] = _ssid;
+  doc["esp_ip"] = WiFi.localIP().toString();
+  String payload;
+  serializeJson(doc, payload);
+  Serial.print("[ESP32_WIFI] ");
+  Serial.println(payload);
 }
 
 bool WifiManager::hasInternet() {
