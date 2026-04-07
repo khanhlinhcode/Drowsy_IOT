@@ -13,6 +13,10 @@ import argparse
 import json
 import math
 import os
+import re
+import select
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -67,7 +71,7 @@ MQTT_KEEPALIVE_S = 5
 MQTT_STATUS_QOS = 1
 #MQTT_META_QOS = 0
 MQTT_META_QOS = 1
-MQTT_HEARTBEAT_MS = 400       # mandatory for ESP32 anti-freeze
+MQTT_HEARTBEAT_MS = 300       # keep stream fresh for ESP32 state sync
 MQTT_RETRY_MIN_S = 1
 MQTT_RETRY_MAX_S = 8
 MQTT_ERR_LOG_GAP_MS = 3000
@@ -76,6 +80,20 @@ MQTT_LOG_GAP_MS = 1500
 MQTT_META_MIN_MS = 100
 MQTT_RETRY_BASE_MS = 500
 MQTT_RETRY_MAX_MS = 8000
+
+ESP32_WIFI_SERIAL_PORT = os.getenv("ESP32_WIFI_SERIAL_PORT", "/dev/ttyUSB0")
+ESP32_WIFI_SERIAL_BAUD = int(os.getenv("ESP32_WIFI_SERIAL_BAUD", "115200"))
+PI_WIFI_INTERFACE = os.getenv("PI_WIFI_INTERFACE", "wlan0")
+DEFAULT_CMD_TIMEOUT_S = 25
+WIFI_SYNC_DUP_WINDOW_MS = 15000
+WIFI_SYNC_RETRY_DELAY_S = 2.0
+WIFI_LOCK_TO_ESP32 = os.getenv("WIFI_LOCK_TO_ESP32", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+WIFI_LOCK_CHECK_MS = int(os.getenv("WIFI_LOCK_CHECK_MS", "2500"))
 
 mqtt_client = None
 _mqtt_connected = False
@@ -90,6 +108,16 @@ _mqtt_retry_ms = MQTT_RETRY_BASE_MS
 _mqtt_next_retry_ms = 0
 
 _mqtt_pub_lock = threading.Lock()
+_wifi_sync_last_signature = ""
+_wifi_sync_last_attempt_ms = 0
+_esp32_serial_fd = -1
+_esp32_serial_lock = threading.Lock()
+_last_broker_hint = ""
+_last_broker_hint_ms = 0
+_wifi_target_lock = threading.Lock()
+_esp32_target_ssid = ""
+_esp32_target_password = ""
+_last_wifi_lock_log_ms = 0
 
 
 def _on_mqtt_connect(_client, _userdata, _flags, rc, *_args):
@@ -101,6 +129,7 @@ def _on_mqtt_connect(_client, _userdata, _flags, rc, *_args):
         _mqtt_retry_ms = MQTT_RETRY_BASE_MS
         _mqtt_next_retry_ms = 0
         print(f"MQTT connected broker={MQTT_BROKER}:{MQTT_PORT}")
+        _send_pi_broker_hint("mqtt_connected")
     else:
         _mqtt_connected = False
         print("MQTT connect failed rc=", rc)
@@ -124,7 +153,7 @@ def _init_mqtt():
     mqtt_client.on_connect = _on_mqtt_connect
     mqtt_client.on_disconnect = _on_mqtt_disconnect
     mqtt_client.reconnect_delay_set(min_delay=MQTT_RETRY_MIN_S, max_delay=MQTT_RETRY_MAX_S)
-    mqtt_client.max_inflight_messages_set(10)
+    mqtt_client.max_inflight_messages_set(5)
     mqtt_client.max_queued_messages_set(20)
     mqtt_client.will_set(MQTT_TOPIC, payload="0", qos=MQTT_STATUS_QOS, retain=False)
     try:
@@ -133,6 +162,291 @@ def _init_mqtt():
         print(f"MQTT init broker={MQTT_BROKER}:{MQTT_PORT}")
     except Exception as exc:
         print("MQTT connection failed:", exc)
+
+
+def _run_cmd(cmd, timeout=DEFAULT_CMD_TIMEOUT_S):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def _is_valid_iface_name(name):
+    return bool(name) and re.fullmatch(r"[A-Za-z0-9._:-]{1,32}", name) is not None
+
+
+def _sanitize_wifi_text(value, max_len):
+    text = "" if value is None else str(value)
+    text = text.replace("\x00", "").replace("\r", "").replace("\n", "").strip()
+    return text[:max_len]
+
+
+def _get_pi_ip(interface):
+    try:
+        res = _run_cmd(["ip", "-4", "-o", "addr", "show", "dev", interface], timeout=8)
+        if res.returncode == 0:
+            lines = (res.stdout or "").strip().splitlines()
+            if lines:
+                parts = lines[0].split()
+                if len(parts) >= 4 and "/" in parts[3]:
+                    return parts[3].split("/", 1)[0]
+    except Exception:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return ""
+
+
+def _resolve_esp32_broker_host():
+    raw = str(MQTT_BROKER).strip()
+    lower = raw.lower()
+    if lower in ("127.0.0.1", "localhost", "0.0.0.0", "::1", ""):
+        ip = _get_pi_ip(PI_WIFI_INTERFACE)
+        return ip if ip else ""
+    if lower.endswith(".local"):
+        ip = _get_pi_ip(PI_WIFI_INTERFACE)
+        return ip if ip else raw
+    return raw
+
+
+def _send_pi_broker_hint(reason):
+    global _last_broker_hint, _last_broker_hint_ms
+    now_ms = int(time.monotonic() * 1000)
+    host = _resolve_esp32_broker_host()
+    if not host:
+        return
+
+    payload = json.dumps(
+        {
+            "type": "broker",
+            "host": host,
+            "port": int(MQTT_PORT),
+        },
+        separators=(",", ":"),
+    )
+    signature = f"{host}:{int(MQTT_PORT)}"
+    if signature == _last_broker_hint and (now_ms - _last_broker_hint_ms) < 2500:
+        return
+
+    with _esp32_serial_lock:
+        if _esp32_serial_fd < 0:
+            return
+        try:
+            os.write(_esp32_serial_fd, f"[PI_BROKER] {payload}\n".encode("utf-8"))
+            _last_broker_hint = signature
+            _last_broker_hint_ms = now_ms
+            print(f"[WIFI_SYNC] sent broker to ESP32 ({reason}): {host}:{int(MQTT_PORT)}")
+        except Exception as exc:
+            print(f"[WIFI_SYNC] send broker failed: {exc}")
+
+
+def _set_wifi_target_from_esp32(ssid, password):
+    global _esp32_target_ssid, _esp32_target_password
+    clean_ssid = _sanitize_wifi_text(ssid, 32)
+    clean_pass = _sanitize_wifi_text(password, 64)
+    if not clean_ssid:
+        return
+    with _wifi_target_lock:
+        if _esp32_target_ssid == clean_ssid and (not clean_pass) and _esp32_target_password:
+            clean_pass = _esp32_target_password
+        _esp32_target_ssid = clean_ssid
+        _esp32_target_password = clean_pass
+
+
+def _get_wifi_target_from_esp32():
+    with _wifi_target_lock:
+        return _esp32_target_ssid, _esp32_target_password
+
+
+def _get_current_wifi_ssid(interface):
+    interface = _sanitize_wifi_text(interface, 32)
+    if not _is_valid_iface_name(interface):
+        return ""
+
+    try:
+        res = _run_cmd(["iwgetid", interface, "-r"], timeout=5)
+        if res.returncode == 0:
+            ssid = (res.stdout or "").strip()
+            if ssid:
+                return ssid
+    except Exception:
+        pass
+
+    try:
+        res = _run_cmd(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "device", "show", interface], timeout=6)
+        if res.returncode == 0:
+            out = (res.stdout or "").strip()
+            if out.startswith("GENERAL.CONNECTION:"):
+                val = out.split(":", 1)[1].strip()
+                if val and val != "--":
+                    return val
+    except Exception:
+        pass
+    return ""
+
+
+def _connect_pi_wifi(ssid, password, interface, force=False):
+    global _wifi_sync_last_signature, _wifi_sync_last_attempt_ms
+    now_ms = int(time.monotonic() * 1000)
+    signature = f"{ssid}\n{password}\n{interface}"
+    if (not force) and signature == _wifi_sync_last_signature and (now_ms - _wifi_sync_last_attempt_ms) < WIFI_SYNC_DUP_WINDOW_MS:
+        return
+
+    _wifi_sync_last_signature = signature
+    _wifi_sync_last_attempt_ms = now_ms
+    interface = _sanitize_wifi_text(interface, 32)
+    if not _is_valid_iface_name(interface):
+        print(f"[WIFI_SYNC] invalid interface: '{interface}'")
+        return
+
+    ssid = _sanitize_wifi_text(ssid, 32)
+    password = _sanitize_wifi_text(password, 64)
+    if not ssid:
+        return
+
+    print(f"[WIFI_SYNC] request ssid='{ssid}' iface={interface}")
+    cmd = ["nmcli", "--wait", "20", "dev", "wifi", "connect", ssid, "ifname", interface]
+    if password:
+        cmd.extend(["password", password])
+
+    try:
+        res = _run_cmd(cmd, timeout=35)
+        if res.returncode != 0:
+            stderr = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            detail = stderr if stderr else stdout
+            if detail:
+                print(f"[WIFI_SYNC] Pi WiFi connect failed: {detail}")
+            else:
+                print("[WIFI_SYNC] Pi WiFi connect failed")
+            return
+
+        pi_ip = _get_pi_ip(interface)
+        if pi_ip:
+            print(f"[WIFI_SYNC] Pi WiFi connected: ssid='{ssid}' ip={pi_ip}")
+        else:
+            print(f"[WIFI_SYNC] Pi WiFi connected: ssid='{ssid}' ip=unknown")
+        _send_pi_broker_hint("pi_wifi_connected")
+        return True
+    except Exception as exc:
+        print(f"[WIFI_SYNC] Pi WiFi connect error: {exc}")
+    return False
+
+
+def _enforce_wifi_lock():
+    global _last_wifi_lock_log_ms
+    if not WIFI_LOCK_TO_ESP32:
+        return
+
+    target_ssid, target_pass = _get_wifi_target_from_esp32()
+    if not target_ssid:
+        return
+
+    now_ms = int(time.monotonic() * 1000)
+    current_ssid = _get_current_wifi_ssid(PI_WIFI_INTERFACE)
+    if current_ssid == target_ssid:
+        return
+
+    if (now_ms - _last_wifi_lock_log_ms) >= 3000:
+        print(
+            f"[WIFI_LOCK] ssid mismatch: current='{current_ssid or 'none'}' "
+            f"target='{target_ssid}' -> reconnect"
+        )
+        _last_wifi_lock_log_ms = now_ms
+    _connect_pi_wifi(target_ssid, target_pass, PI_WIFI_INTERFACE, force=True)
+
+
+def _handle_esp32_wifi_sync_line(line):
+    prefix = "[ESP32_WIFI] "
+    if not line.startswith(prefix):
+        return
+    raw = line[len(prefix):].strip()
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return
+
+    msg_type = str(data.get("type", "")).strip().lower()
+    if msg_type == "wifi_credentials":
+        _set_wifi_target_from_esp32(
+            str(data.get("ssid", "")).strip(),
+            str(data.get("pass", "")).strip(),
+        )
+        connected = _connect_pi_wifi(
+            str(data.get("ssid", "")).strip(),
+            str(data.get("pass", "")).strip(),
+            PI_WIFI_INTERFACE,
+        )
+        if connected:
+            _send_pi_broker_hint("wifi_credentials")
+    elif msg_type == "wifi_connected":
+        esp_ip = str(data.get("esp_ip", "")).strip()
+        ssid = str(data.get("ssid", "")).strip()
+        if ssid:
+            _set_wifi_target_from_esp32(ssid, "")
+        if esp_ip:
+            print(f"[WIFI_SYNC] ESP32 connected: ssid='{ssid}' esp_ip={esp_ip}")
+        _send_pi_broker_hint("wifi_connected")
+
+
+def _esp32_wifi_sync_worker():
+    global _esp32_serial_fd
+    serial_path = ESP32_WIFI_SERIAL_PORT
+    if not serial_path:
+        return
+
+    while not _stop_event.is_set():
+        fd = -1
+        try:
+            _run_cmd(
+                [
+                    "stty",
+                    "-F",
+                    serial_path,
+                    str(ESP32_WIFI_SERIAL_BAUD),
+                    "cs8",
+                    "-cstopb",
+                    "-parenb",
+                    "-icanon",
+                    "-echo",
+                    "min",
+                    "0",
+                    "time",
+                    "1",
+                ],
+                timeout=8,
+            )
+            fd = os.open(serial_path, os.O_RDWR | os.O_NONBLOCK)
+            with _esp32_serial_lock:
+                _esp32_serial_fd = fd
+            print(f"[WIFI_SYNC] listening {serial_path}@{ESP32_WIFI_SERIAL_BAUD}")
+            _send_pi_broker_hint("serial_open")
+            buf = ""
+            while not _stop_event.is_set():
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 512)
+                if not chunk:
+                    continue
+                buf += chunk.decode("utf-8", errors="ignore")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    _handle_esp32_wifi_sync_line(line.strip())
+        except Exception:
+            _stop_event.wait(WIFI_SYNC_RETRY_DELAY_S)
+        finally:
+            with _esp32_serial_lock:
+                if _esp32_serial_fd == fd:
+                    _esp32_serial_fd = -1
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
 
 
 # NOTE: _init_mqtt() is called from main() after CLI args are parsed.
@@ -174,9 +488,9 @@ USB_CAMERA_FPS = _env_int("USB_CAMERA_FPS", 30)
 USE_GRAYSCALE = False
 
 # Adaptive inference timing (ms)
-INFER_SAFE_MS = 125
-INFER_RISK_MS = 75
-INFER_NO_FACE_MS = 90
+INFER_SAFE_MS = 95
+INFER_RISK_MS = 60
+INFER_NO_FACE_MS = 70
 
 # EAR/MAR thresholds
 EAR_CLOSE = 215
@@ -214,9 +528,9 @@ RELEASE_X10 = 18
 MAX_HOLD = 4000
 
 # State stability for demo-safe classification
-DROWSY_HOLD_MS = 700
-DANGER_HOLD_MS = 900
-STATUS_MIN_SWITCH_MS = 180
+DROWSY_HOLD_MS = 550
+DANGER_HOLD_MS = 700
+STATUS_MIN_SWITCH_MS = 140
 DROWSY_ENTER = 80.0
 DROWSY_EXIT = 62.0
 VERY_TIRED_EXIT = 54.0
@@ -224,9 +538,17 @@ TIRED_EXIT = 34.0
 FATIGUE_EMA_ALPHA_RISE = 0.18
 FATIGUE_EMA_ALPHA_FALL = 0.34
 STATUS_VOTE_WINDOW = 3
-INFER_INTERVAL_MAX_MS = 220
+INFER_INTERVAL_MAX_MS = 160
 FAST_RECOVERY_MS = 300
 FAST_RECOVERY_FATIGUE = 60.0
+ATTENTIVE_ARM_MS = 30000
+ATTENTIVE_BREAK_GRACE_MS = 1500
+PI_ARM_GATE_ENABLED = os.getenv("PI_ARM_GATE_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Fatigue rates (existing logic preserved)
 RATE_BASE_REC = 80
@@ -265,7 +587,7 @@ COLOR_SAFE = (0, 220, 0)
 COLOR_WARN = (0, 215, 255)
 COLOR_DANG = (0, 0, 255)
 COLOR_TEXT = (245, 245, 245)
-PANEL_H = 88
+PANEL_H = 104
 PANEL_W = 124
 CAM_LOG_GAP_MS = 2000
 
@@ -459,7 +781,12 @@ _last_out = {
     "mar": 0.0,
     "perclos": 0.0,
     "signal": 0,
+    "armed": 0,
 }
+
+_drowsy_armed = not PI_ARM_GATE_ENABLED
+_attentive_since_ms = 0
+_attentive_break_since_ms = 0
 
 STATUS_SIGNAL = {
     "ATTENTIVE": 0,
@@ -472,7 +799,7 @@ STATUS_SIGNAL = {
     "LOOKING SIDE": 1,
     "HEAD TILT": 1,
     "DISTRACTED": 2,
-    "HEAD DOWN": 3,
+    "HEAD DOWN": 2,
     "DROWSY": 3,
     "MICROSLEEP": 3,
     "NO FACE": 0,
@@ -486,7 +813,7 @@ STATUS_TO_ESP32_TEXT = {
     "VERY TIRED": "SLEEPY",
     "DROWSY": "MICROSLEEP",
     "MICROSLEEP": "MICROSLEEP",
-    "HEAD DOWN": "MICROSLEEP",
+    "HEAD DOWN": "SLEEPY",
     "DISTRACTED": "SLEEPY",
     "LOOKING DOWN": "LOOKING DOWN",
     "LOOKING LEFT": "TIRED",
@@ -495,6 +822,23 @@ STATUS_TO_ESP32_TEXT = {
     "HEAD TILT": "TIRED",
     "NO FACE": "ATTENTIVE",
 }
+
+
+def _esp_status_for(status):
+    return STATUS_TO_ESP32_TEXT.get(status, "ATTENTIVE")
+
+
+def _expected_buzzer_code(status, armed):
+    if not armed:
+        return "OFF"
+    esp_status = _esp_status_for(status)
+    if esp_status in ("MICROSLEEP", "SLEEP"):
+        return "CONT"
+    if esp_status == "SLEEPY":
+        return "FAST"
+    if esp_status == "TIRED":
+        return "SLOW"
+    return "OFF"
 
 DANGER_STATES = {"DROWSY", "MICROSLEEP", "HEAD DOWN"}
 WARN_STATES = {
@@ -593,6 +937,14 @@ def _is_expected_frame_size(frame):
     return frame.shape[0] == FRAME_H and frame.shape[1] == FRAME_W
 
 
+def _ensure_frame_ownership(frame):
+    if frame is None:
+        return None
+    if (not frame.flags["OWNDATA"]) or (not frame.flags["C_CONTIGUOUS"]):
+        return frame.copy()
+    return frame
+
+
 def _next_ts(now_ms):
     global _last_mp_ts
     if now_ms <= _last_mp_ts:
@@ -620,14 +972,17 @@ def _publish_signal(status, signal, fatigue, now_ms):
     if mqtt_client is None:
         return
 
-    sig = int(signal)
+    sig_from_status = STATUS_SIGNAL.get(status, signal)
+    sig = int(sig_from_status)
     fat = int(fatigue)
     # Translate to text ESP32 understands
-    esp_status = STATUS_TO_ESP32_TEXT.get(status, "ATTENTIVE")
+    esp_status = _esp_status_for(status)
 
     with _mqtt_pub_lock:
         status_changed = (status != _last_sent) or (sig != _last_sent_signal)
-        should_send = _mqtt_force_sync or status_changed or ((now_ms - _last_sent_ms) >= MQTT_HEARTBEAT_MS)
+        danger_now = status in DANGER_STATES
+        heartbeat_ms = 120 if danger_now else MQTT_HEARTBEAT_MS
+        should_send = _mqtt_force_sync or status_changed or ((now_ms - _last_sent_ms) >= heartbeat_ms)
         if not should_send:
             return
 
@@ -642,7 +997,7 @@ def _publish_signal(status, signal, fatigue, now_ms):
         meta_due = (
             status != _last_mqtt_meta_status
             or sig != _last_sent_signal
-            or (now_ms - _last_mqtt_meta_ms) >= MQTT_META_MIN_MS
+            or (now_ms - _last_mqtt_meta_ms) >= (120 if danger_now else MQTT_META_MIN_MS)
         )
         meta_payload = None
         if meta_due:
@@ -696,7 +1051,7 @@ def _publish_signal(status, signal, fatigue, now_ms):
             _last_mqtt_meta_ms = now_ms
             _last_mqtt_meta_status = status
 
-    if status_changed or status != _last_mqtt_log_status or (now_ms - _last_mqtt_log_ms) >= MQTT_LOG_GAP_MS:
+    if status_changed or danger_now or status != _last_mqtt_log_status or (now_ms - _last_mqtt_log_ms) >= MQTT_LOG_GAP_MS:
         print("MQTT PUB:", sig, "|", esp_status, "| FATIGUE:", fat)
         _last_mqtt_log_ms = now_ms
         _last_mqtt_log_status = status
@@ -704,8 +1059,15 @@ def _publish_signal(status, signal, fatigue, now_ms):
 
 def _log_status(status, fatigue, now_ms):
     global _last_print_status, _last_status_log_ms
+    armed = int(_last_out.get("armed", 1)) == 1
+    esp_status = _esp_status_for(status)
+    signal = STATUS_SIGNAL.get(status, 0)
+    buzz = _expected_buzzer_code(status, armed)
     if status != _last_print_status or (now_ms - _last_status_log_ms) >= 5000:
-        print("STATUS:", status, "| FATIGUE:", int(fatigue))
+        print(
+            f"STATUS: {status} | ESP:{esp_status} | SIG:{int(signal)} "
+            f"| ARM:{1 if armed else 0} | BUZZ:{buzz} | FATIGUE:{int(fatigue)}"
+        )
         _last_print_status = status
         _last_status_log_ms = now_ms
 
@@ -964,6 +1326,7 @@ def process_frame(frame):
     global _fatigue_ema, _drowsy_latched
     global _last_drowsy_ts, _last_danger_ts, _last_status_change_ms
     global _recovery_start_ts, _status_vote
+    global _drowsy_armed, _attentive_since_ms, _attentive_break_since_ms
 
     now = int(time.monotonic() * 1000)
 
@@ -972,6 +1335,8 @@ def process_frame(frame):
         _bbox_valid = False
         _drowsy_latched = False
         _recovery_start_ts = 0
+        _attentive_since_ms = 0
+        _attentive_break_since_ms = 0
         _status_vote.clear()
 
         # 🔥 GIỮ trạng thái nguy hiểm
@@ -987,6 +1352,7 @@ def process_frame(frame):
         _last_out["fatigue_eval"] = int(_fatigue_ema)
         _last_out["blink_total"] = _blink_total
         _last_out["signal"] = 0
+        _last_out["armed"] = 1 if _drowsy_armed else 0
 
         _publish_signal("NO FACE", 0, _fatigue, now)
         return dict(_last_out), frame
@@ -1067,6 +1433,8 @@ def process_frame(frame):
         _bbox_valid = False
         _drowsy_latched = False
         _recovery_start_ts = 0
+        _attentive_since_ms = 0
+        _attentive_break_since_ms = 0
         _status_vote.clear()
         if _last_out.get("status") != "NO FACE":
             _last_status_change_ms = now
@@ -1075,6 +1443,7 @@ def process_frame(frame):
         _last_out["fatigue_eval"] = int(_fatigue_ema)
         _last_out["blink_total"] = _blink_total
         _last_out["signal"] = 0
+        _last_out["armed"] = 1 if _drowsy_armed else 0
         _publish_signal("NO FACE", 0, _fatigue, now)
         return dict(_last_out), frame
 
@@ -1093,6 +1462,8 @@ def process_frame(frame):
         _bbox_valid = False
         _drowsy_latched = False
         _recovery_start_ts = 0
+        _attentive_since_ms = 0
+        _attentive_break_since_ms = 0
         _status_vote.clear()
 
         _side_h = _decay(_side_h, dt)
@@ -1119,6 +1490,7 @@ def process_frame(frame):
         _last_out["fatigue_eval"] = int(_fatigue_ema)
         _last_out["blink_total"] = _blink_total
         _last_out["signal"] = 0
+        _last_out["armed"] = 1 if _drowsy_armed else 0
 
         _publish_signal("NO FACE", 0, _fatigue, now)
         return dict(_last_out), frame
@@ -1458,6 +1830,34 @@ def process_frame(frame):
     if status_candidate != prev_status:
         _last_status_change_ms = ts
 
+    forward_face = (
+        (not _eye_closed)
+        and (not _mouth_open)
+        and (head == "CENTER")
+        and (attn == "ATTENTIVE")
+        and (pc_1000 < 260)
+    )
+    if PI_ARM_GATE_ENABLED and (not _drowsy_armed):
+        if forward_face:
+            _attentive_break_since_ms = 0
+            if _attentive_since_ms == 0:
+                _attentive_since_ms = ts
+            elif (ts - _attentive_since_ms) >= ATTENTIVE_ARM_MS:
+                _drowsy_armed = True
+                print("[ARM] face-forward 30s -> drowsy detection enabled")
+        else:
+            if _attentive_since_ms != 0:
+                if _attentive_break_since_ms == 0:
+                    _attentive_break_since_ms = ts
+                elif (ts - _attentive_break_since_ms) >= ATTENTIVE_BREAK_GRACE_MS:
+                    _attentive_since_ms = 0
+                    _attentive_break_since_ms = 0
+
+        if not _drowsy_armed:
+            status_candidate = "ATTENTIVE"
+            _drowsy_latched = False
+            _status_vote.clear()
+
     status = status_candidate
 
     signal = STATUS_SIGNAL.get(status, 0)
@@ -1476,6 +1876,7 @@ def process_frame(frame):
     _last_out["attn"] = attn
     _last_out["distracted"] = int(distracted)
     _last_out["signal"] = signal
+    _last_out["armed"] = 1 if _drowsy_armed else 0
 
     _log_status(status, _fatigue, now)
     _publish_signal(status, signal, _fatigue, now)
@@ -1505,9 +1906,11 @@ _proc_skip_n = 2
 
 
 def _draw_ui(frame, out, fps, infer_ms, now_ms, ui_state, redraw_panel):
+    global _attentive_since_ms
     status = out.get("status", "NO FACE")
     fatigue = int(out.get("fatigue", 0))
     blink = int(out.get("blink_total", 0))
+    armed = int(out.get("armed", 1)) == 1
 
     target = _status_color(status)
     ui_color = ui_state["color"]
@@ -1542,6 +1945,18 @@ def _draw_ui(frame, out, fps, infer_ms, now_ms, ui_state, redraw_panel):
         cv2.putText(panel, f"Blink:   {blink:3d}", (6, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.39, COLOR_TEXT, 1)
         cv2.putText(panel, f"FPS:     {fps:4.1f}", (6, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.39, COLOR_TEXT, 1)
         cv2.putText(panel, f"INF:     {infer_ms:4.1f}ms", (6, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.39, COLOR_TEXT, 1)
+        if PI_ARM_GATE_ENABLED and (not armed):
+            if _attentive_since_ms > 0:
+                remain_ms = max(0, ATTENTIVE_ARM_MS - (now_ms - _attentive_since_ms))
+            else:
+                remain_ms = ATTENTIVE_ARM_MS
+            arm_text = f"ARM:{int(remain_ms / 1000):2d}s BZ:OFF"
+            arm_color = COLOR_WARN
+        else:
+            buzz = _expected_buzzer_code(status, armed)
+            arm_text = f"DET:{'ON ' if armed else 'OFF'} BZ:{buzz}"
+            arm_color = COLOR_SAFE if armed else COLOR_WARN
+        cv2.putText(panel, arm_text, (6, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.39, arm_color, 1)
         ui_state["panel"] = panel
         ui_state["panel_w"] = panel_w
         ui_state["panel_h"] = panel_h
@@ -1583,6 +1998,12 @@ def _mqtt_reconnect_worker():
             _mqtt_retry_ms = min(_mqtt_retry_ms * 2, MQTT_RETRY_MAX_MS)
 
         _stop_event.wait(0.05)
+
+
+def _wifi_lock_worker():
+    while not _stop_event.is_set():
+        _enforce_wifi_lock()
+        _stop_event.wait(max(0.4, WIFI_LOCK_CHECK_MS / 1000.0))
 
 
 def _usb_api_candidates():
@@ -1677,7 +2098,7 @@ def _camera_worker_usb(cap, stream_format):
         if not _is_expected_frame_size(frame):
             frame = cv2.resize(frame, (FRAME_W, FRAME_H), interpolation=cv2.INTER_AREA)
 
-        frame = np.ascontiguousarray(frame).copy()
+        frame = np.ascontiguousarray(frame)
         if not _is_valid_color_frame(frame):
             _stop_event.wait(0.003)
             continue
@@ -1721,7 +2142,10 @@ def _processing_worker():
 
         if frame is None or seq == last_seq:
             continue
-        if frame_ts > 0.0 and (time.monotonic() - frame_ts) > 0.3:
+        frame = _ensure_frame_ownership(frame)
+        if frame is None:
+            continue
+        if frame_ts > 0.0 and (time.monotonic() - frame_ts) > 0.2:
             _stop_event.wait(0.002)
             continue
         if not _is_valid_color_frame(frame):
@@ -1775,20 +2199,20 @@ def _processing_worker():
 
         infer_ms = _last_infer_time_ms
         if infer_ms > 100:
-            base_skip_n = 8
-        elif infer_ms > 80:
             base_skip_n = 6
-        elif infer_ms > 60:
+        elif infer_ms > 80:
             base_skip_n = 4
+        elif infer_ms > 60:
+            base_skip_n = 3
         else:
-            base_skip_n = 2
+            base_skip_n = 1
 
         # Keep status transitions responsive while still reducing load.
         status_now = out.get("status", "NO FACE")
         if status_now in DANGER_STATES:
-            _proc_skip_n = min(base_skip_n, 2)
+            _proc_skip_n = min(base_skip_n, 1)
         elif status_now in WARN_STATES:
-            _proc_skip_n = min(base_skip_n, 3)
+            _proc_skip_n = min(base_skip_n, 2)
         else:
             _proc_skip_n = base_skip_n
         output_count += 1
@@ -1937,6 +2361,7 @@ def _headless_loop():
 
 def main():
     global MQTT_BROKER, MQTT_PORT
+    global ESP32_WIFI_SERIAL_PORT, ESP32_WIFI_SERIAL_BAUD, PI_WIFI_INTERFACE
     global USB_CAMERA_SOURCE, USB_CAMERA_WIDTH, USB_CAMERA_HEIGHT, USB_CAMERA_FPS
 
     parser = argparse.ArgumentParser(description="Drowsiness Edge Detection — RPi4 + ESP32")
@@ -1946,6 +2371,9 @@ def main():
     parser.add_argument("--width", type=int, default=224, help="Frame width (default: 224)")
     parser.add_argument("--height", type=int, default=168, help="Frame height (default: 168)")
     parser.add_argument("--fps", type=int, default=30, help="Camera FPS target (default: 30)")
+    parser.add_argument("--esp32-serial", default=None, help="ESP32 serial device for WiFi sync (default: /dev/ttyUSB0)")
+    parser.add_argument("--esp32-baud", type=int, default=None, help="ESP32 serial baud for WiFi sync (default: 115200)")
+    parser.add_argument("--pi-wifi-iface", default=None, help="Pi WiFi interface for nmcli connect (default: wlan0)")
     parser.add_argument("--no-preview", dest="preview", action="store_false", default=True,
                         help="Disable preview window (headless mode)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -1960,6 +2388,12 @@ def main():
         MQTT_BROKER = args.mqtt_host
     if args.mqtt_port is not None:
         MQTT_PORT = args.mqtt_port
+    if args.esp32_serial is not None:
+        ESP32_WIFI_SERIAL_PORT = args.esp32_serial
+    if args.esp32_baud is not None and args.esp32_baud > 0:
+        ESP32_WIFI_SERIAL_BAUD = args.esp32_baud
+    if args.pi_wifi_iface is not None:
+        PI_WIFI_INTERFACE = args.pi_wifi_iface
 
     # Init MQTT after CLI args are applied
     _init_mqtt()
@@ -1975,6 +2409,9 @@ def main():
         f"target={USB_CAMERA_WIDTH}x{USB_CAMERA_HEIGHT}@{USB_CAMERA_FPS}"
     )
     print(f"MQTT broker={MQTT_BROKER}:{MQTT_PORT}")
+    print(f"WiFi sync serial={ESP32_WIFI_SERIAL_PORT}@{ESP32_WIFI_SERIAL_BAUD} iface={PI_WIFI_INTERFACE}")
+    print(f"WiFi lock mode={'ON (ESP32 SSID only)' if WIFI_LOCK_TO_ESP32 else 'OFF'}")
+    print(f"Pi arm gate={'ON(30s)' if PI_ARM_GATE_ENABLED else 'OFF (ESP32 handles 30s gate)'}")
     print(f"Preview={'ON' if args.preview else 'OFF (headless)'}")
 
     try:
@@ -1998,9 +2435,13 @@ def main():
     )
     proc_thread = threading.Thread(target=_processing_worker, name="processor", daemon=True)
     mqtt_thread = threading.Thread(target=_mqtt_reconnect_worker, name="mqtt-reconnect", daemon=True)
+    wifi_sync_thread = threading.Thread(target=_esp32_wifi_sync_worker, name="wifi-sync", daemon=True)
+    wifi_lock_thread = threading.Thread(target=_wifi_lock_worker, name="wifi-lock", daemon=True)
     cam_thread.start()
     proc_thread.start()
     mqtt_thread.start()
+    wifi_sync_thread.start()
+    wifi_lock_thread.start()
 
     try:
         if args.preview:
@@ -2014,6 +2455,8 @@ def main():
         cam_thread.join(timeout=1.5)
         proc_thread.join(timeout=1.5)
         mqtt_thread.join(timeout=1.0)
+        wifi_sync_thread.join(timeout=1.0)
+        wifi_lock_thread.join(timeout=1.0)
 
         # Send SAFE signal to ESP32 before disconnecting
         try:
