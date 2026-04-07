@@ -4,6 +4,7 @@
 WifiManager::WifiManager(const Config& config) : _cfg(config), _server(80) {}
 
 void WifiManager::begin(const char* apPrefix) {
+  _flowState = FLOW_BOOT;
   _apPrefix = String(apPrefix == nullptr ? "DrowsySetup" : apPrefix);
   _lastConnectedMs = millis();
   _wifiState = WIFI_DISCONNECTED;
@@ -27,8 +28,10 @@ void WifiManager::begin(const char* apPrefix) {
   setupRoutes();
 
   if (hasCredentials()) {
+  _flowState = FLOW_STA_CONNECT;  
     beginConnect(millis());
   } else {
+    _flowState = FLOW_PORTAL; 
     startPortal();
   }
 }
@@ -51,7 +54,9 @@ void WifiManager::tick(uint32_t nowMs) {
         stopPortal();
       }
     }
+    _flowState = FLOW_STA_CONNECT;   // NEW
     _wasConnected = true;
+    
 
     if ((nowMs - _lastInternetCheckMs) >= _cfg.internetCheckIntervalMs) {
       _lastInternetCheckMs = nowMs;
@@ -79,10 +84,12 @@ void WifiManager::tick(uint32_t nowMs) {
     Serial.println("[WIFI] TIMEOUT");
     WiFi.disconnect(true, false);
     _wifiState = WIFI_DISCONNECTED;
+     _flowState = FLOW_RECONNECT;     
     _nextWifiRetryMs = nowMs + _wifiBackoffMs;
   }
 
   if (_wifiState == WIFI_DISCONNECTED && hasCredentials() && nowMs >= _nextWifiRetryMs) {
+    _flowState = FLOW_RECONNECT;  
     beginConnect(nowMs);
   }
 
@@ -91,6 +98,7 @@ void WifiManager::tick(uint32_t nowMs) {
     const bool noCreds = !hasCredentials();
     const bool disconnectedLong = (nowMs - _lastConnectedMs) >= _cfg.portalFallbackMs;
     if (noCreds || disconnectedLong) {
+      _flowState = FLOW_PORTAL;      
       startPortal();
     }
   }
@@ -121,6 +129,15 @@ void WifiManager::clearCredentials() {
   _wifiBackoffMs = WIFI_BACKOFF_MIN_MS;
   _nextWifiRetryMs = millis() + _wifiBackoffMs;
   startPortal();
+}
+
+void WifiManager::openPortal() {
+  // Force-open AP config portal WITHOUT clearing saved credentials.
+  // The user can enter new credentials, or cancel and the ESP32 will
+  // continue trying the existing saved credentials.
+  _flowState = FLOW_PORTAL;
+  startPortal();
+  Serial.println("[WIFI] Portal forced open (credentials preserved)");
 }
 
 void WifiManager::loadCredentials() {
@@ -156,12 +173,12 @@ void WifiManager::beginConnect(uint32_t nowMs) {
 }
 
 bool WifiManager::hasInternet() {
+  if (!_cfg.requireInternet) return true;
+
   WiFiClient client;
-  client.setTimeout(120);
-  const bool ok = client.connect("8.8.8.8", 53);
-  if (ok) {
-    client.stop();
-  }
+  client.setTimeout(150);
+  const bool ok = client.connect(_cfg.healthHost, _cfg.healthPort);
+  if (ok) client.stop();
   return ok;
 }
 
@@ -226,6 +243,7 @@ void WifiManager::handleSave() {
   }
 
   saveCredentials(ssid, pass);
+  _flowState = FLOW_RECONNECT;
   beginConnect(millis());
 
   _server.send(200, "application/json", "{\"ok\":true,\"message\":\"saved\"}");

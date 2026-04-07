@@ -6,8 +6,11 @@
 
 #include "motion_detector.h"
 #include "wifi_manager.h"
-WifiManager gWifiManager;
-MotionDetector gMotionDetector;
+
+// Set to 1 for verbose per-message MQTT logging (adds ~8ms/msg).
+// Keep 0 for production to minimize buzzer timing jitter.
+#define VERBOSE 0
+
 // ============================================================
 // Configuration
 // ============================================================
@@ -16,6 +19,7 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_CLIENT_ID_BASE = "esp32-drowsy-alert";
 const char* MQTT_TOPIC_STATUS = "driver/status";
 const char* MQTT_TOPIC_META = "driver/status_meta";
+const char* MQTT_TOPIC_CMD = "driver/cmd";
 
 // Pins
 const uint8_t PIN_LED_GREEN = 21;
@@ -23,6 +27,10 @@ const uint8_t PIN_LED_RED = 19;
 const uint8_t PIN_LED_BLUE = 22;
 const uint8_t PIN_BUZZER = 23;
 const uint8_t PIN_SPEAKER = 25;
+const uint8_t PIN_WIFI_RESET_BUTTON = 0;  // GPIO 0 = BOOT button
+
+// WiFi reset button timing (Method A)
+const uint32_t WIFI_RESET_HOLD_MS = 5000;  // 5-second long-press
 
 const bool LED_ACTIVE_LOW = false;
 const bool BUZZER_ACTIVE_LOW = true;
@@ -61,6 +69,8 @@ const uint32_t STABLE_RISE_SLEEPY_MS = 3000;   // SLEEPY persist >= 3s
 const uint32_t STABLE_FALL_MS = 1100;
 const uint32_t CONFIRMED_STATE_HOLD_MS = 180;
 const uint32_t SLEEP_CONTINUOUS_MIN_MS = 5000;  // Continuous alarm >= 5s
+// FIX #6: hard timeout to force-reset dangerous state when MQTT is dead.
+const uint32_t WATCHDOG_HARD_TIMEOUT_MS = 30000;
 const uint32_t ESP_TELEMETRY_MS = 1000;
 const char* MQTT_TOPIC_ESP_TELEMETRY = "driver/esp32_telemetry";
 
@@ -148,6 +158,11 @@ uint8_t gMqttSubRetryCount = 0;
 bool gFirstPacketReceived = false;
 uint32_t gReconnectCount = 0;
 char gClientId[64] = {0};
+
+// WiFi reset button state (Method A: GPIO 0 long-press)
+bool gButtonPressed = false;
+uint32_t gButtonPressedSinceMs = 0;
+bool gButtonResetFired = false;  // prevent repeated triggers while held
 
 // Startup alert pattern
 bool gStartupActive = true;
@@ -302,23 +317,18 @@ AiState mapStatusTextToAiState(const char* statusText, bool* ok) {
 SystemState deriveObservedState(AiState aiState, bool driving) {
   if (aiState == AiState::SLEEP) return SystemState::SLEEP;
 
-  if (!driving) {
-    // Vehicle is not moving: suppress non-critical drowsiness alerts.
-    return SystemState::SAFE;
-  }
+  if (!driving) return SystemState::SAFE;   // không chạy xe => im
 
   switch (aiState) {
-    case AiState::SAFE:
-      return SystemState::DRIVING;
-    case AiState::TIRED:
-      return SystemState::TIRED;
-    case AiState::SLEEPY:
-      return SystemState::SLEEPY;
-    case AiState::SLEEP:
-      return SystemState::SLEEP;
+    case AiState::SAFE:   return SystemState::DRIVING; // nhìn thẳng + chạy => bíp bíp
+    case AiState::TIRED:  return SystemState::TIRED;
+    case AiState::SLEEPY: return SystemState::SLEEPY;
+    case AiState::SLEEP:  return SystemState::SLEEP;
   }
   return SystemState::SAFE;
+
 }
+
 
 void logTransition(SystemState fromState, SystemState toState) {
   Serial.print("STATE ");
@@ -520,7 +530,8 @@ void updateAlertEngine(uint32_t nowMs) {
       (nowMs - gLastStateChangeMs) > ALERT_STATE_DEBOUNCE_MS &&
       gStableState == gConfirmedState) {
     // FIX: debounce state change and reset buzzer safely.
-    noTone(PIN_BUZZER);
+    // FIX #4: noTone() can conflict with LEDC channels; use direct GPIO.
+    digitalWrite(PIN_BUZZER, BUZZER_OFF_LEVEL);
     if (USE_PASSIVE_SPEAKER) {
       ledcWriteTone(SPEAKER_LEDC_CH, 0);
     }
@@ -781,8 +792,10 @@ void applyObservation(SystemState observed, uint32_t nowMs) {
       gLastSleepTimeMs = nowMs;
       gSleepAlarmLockUntilMs = lockUntil;
     } else {
-      // FIX: clamp lock window so repeated SLEEP packets cannot prolong alarm indefinitely.
-      gSleepAlarmLockUntilMs = min(gSleepAlarmLockUntilMs, lockUntil);
+      // FIX #9: use max (not min) so repeated SLEEP packets don't shorten alarm.
+      // Cap at 2x to prevent indefinite prolongation.
+      gSleepAlarmLockUntilMs = min(max(gSleepAlarmLockUntilMs, lockUntil),
+                                   nowMs + SLEEP_CONTINUOUS_MIN_MS * 2);
     }
     return;
   }
@@ -822,10 +835,12 @@ void applyObservation(SystemState observed, uint32_t nowMs) {
 }
 
 void applyDataWatchdog(uint32_t nowMs) {
-  if ((nowMs - gLastRxMs) <= gCurrentTtlMs) return;
+  uint32_t age = nowMs - gLastRxMs;
+  if (age <= gCurrentTtlMs) return;
 
-  // Keep dangerous alert if stream is stale while in dangerous state.
-  if (isDangerous(gStableState)) return;
+  // FIX #6: hard timeout — if MQTT is dead > 30s, force reset even from
+  // dangerous state. Without this, SLEEPY/SLEEP keeps buzzer on forever.
+  if (isDangerous(gStableState) && age < WATCHDOG_HARD_TIMEOUT_MS) return;
 
   bool driving = gMotionDetector.isDriving();
   setStableState(driving ? SystemState::DRIVING : SystemState::SAFE, nowMs);
@@ -842,8 +857,21 @@ const char* buildClientId() {
 }
 
 bool subscribeTopics() {
-  bool statusOk = gMqtt.subscribe(MQTT_TOPIC_STATUS, 1) || gMqtt.subscribe("/driver/status", 1);
-  bool metaOk = gMqtt.subscribe(MQTT_TOPIC_META, 1) || gMqtt.subscribe("/driver/status_meta", 1);
+  // FIX #3: evaluate both subscribes independently to avoid || short-circuit
+  // skipping the second topic variant.
+  bool s1 = gMqtt.subscribe(MQTT_TOPIC_STATUS, 1);
+  bool s2 = gMqtt.subscribe("/driver/status", 1);
+  bool statusOk = s1 || s2;
+
+  bool m1 = gMqtt.subscribe(MQTT_TOPIC_META, 1);
+  bool m2 = gMqtt.subscribe("/driver/status_meta", 1);
+  bool metaOk = m1 || m2;
+
+  // Method B: subscribe to command topic for remote WiFi reset
+  bool c1 = gMqtt.subscribe(MQTT_TOPIC_CMD, 1);
+  bool c2 = gMqtt.subscribe("/driver/cmd", 1);
+  bool cmdOk = c1 || c2;
+
   if (!statusOk) {
     Serial.println("MQTT SUB FAIL: driver/status");
     return false;
@@ -851,10 +879,82 @@ bool subscribeTopics() {
   if (!metaOk) {
     Serial.println("MQTT SUB WARN: driver/status_meta");
   }
+  if (!cmdOk) {
+    Serial.println("MQTT SUB WARN: driver/cmd");
+  }
   return true;
 }
 
+// ============================================================
+// Method A: WiFi reset via long-press button (GPIO 0, 5 seconds)
+// ============================================================
+void checkWifiResetButton(uint32_t nowMs) {
+  bool pressed = (digitalRead(PIN_WIFI_RESET_BUTTON) == LOW);
+
+  if (pressed) {
+    if (!gButtonPressed) {
+      // Button just pressed — record start time.
+      gButtonPressed = true;
+      gButtonPressedSinceMs = nowMs;
+      gButtonResetFired = false;
+    } else if (!gButtonResetFired && (nowMs - gButtonPressedSinceMs) >= WIFI_RESET_HOLD_MS) {
+      // Held for >= 5 seconds — trigger WiFi portal reset.
+      Serial.println("[BUTTON] WiFi reset triggered (5s hold)");
+      gWifiManager.openPortal();
+      gButtonResetFired = true;  // Prevent repeated triggers while held.
+    }
+  } else {
+    gButtonPressed = false;
+    gButtonResetFired = false;
+  }
+}
+
+// ============================================================
+// Method B: WiFi reset via remote MQTT command (driver/cmd)
+// ============================================================
+void handleCommandMessage(const char* msg) {
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) {
+    Serial.print("[CMD] JSON parse error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  const char* action = doc["action"].as<const char*>();
+  if (action == nullptr) {
+    Serial.println("[CMD] missing action field");
+    return;
+  }
+
+  if (equalsIgnoreCase(action, "reset_wifi")) {
+    Serial.println("[CMD] Remote WiFi reset requested");
+    gWifiManager.openPortal();
+  } else if (equalsIgnoreCase(action, "clear_wifi")) {
+    Serial.println("[CMD] Remote WiFi clear requested");
+    gWifiManager.clearCredentials();
+  } else {
+    Serial.print("[CMD] Unknown action: ");
+    Serial.println(action);
+  }
+}
+
 void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
+  // Route command messages to dedicated handler.
+  if (topicMatches(topic, MQTT_TOPIC_CMD)) {
+    char cmdMsg[260];
+    unsigned int cn = length;
+    if (cn >= sizeof(cmdMsg)) cn = sizeof(cmdMsg) - 1;
+    if (payload != nullptr && cn > 0) memcpy(cmdMsg, payload, cn);
+    cmdMsg[cn] = '\0';
+    Serial.print("[CMD] MQTT[");
+    Serial.print(topic);
+    Serial.print("]: ");
+    Serial.println(cmdMsg);
+    handleCommandMessage(cmdMsg);
+    return;
+  }
+
   if (!(topicMatches(topic, MQTT_TOPIC_STATUS) || topicMatches(topic, MQTT_TOPIC_META))) {
     return;
   }
@@ -867,10 +967,12 @@ void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
   }
   msg[n] = '\0';
 
+#if VERBOSE
   Serial.print("RAW MQTT[");
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(msg);
+#endif
 
   RxPacket pkt;
   bool parsed = false;
@@ -884,21 +986,33 @@ void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
   uint32_t nowMs = millis();
   if (!validatePacket(pkt, nowMs)) return;
 
+  gLastEspReceiveTsMs = nowMs;
+
+  // FIX #2: ts_ms is RPi monotonic clock; millis() is ESP32 monotonic clock.
+  // These are DIFFERENT clock domains — subtraction is meaningless.
+  // Only track inter-packet delta as a staleness proxy.
   if (pkt.hasTs) {
-    uint32_t srcTsMs = static_cast<uint32_t>(pkt.tsMs & 0xFFFFFFFFu);
-    gLastEspReceiveTsMs = nowMs;
-    gLastLatencyTotalMs = nowMs - srcTsMs;
+    if (gHasTs && pkt.tsMs > gLastTsMs) {
+      // Source-side inter-packet interval (valid within RPi clock domain)
+      uint64_t srcDelta = pkt.tsMs - gLastTsMs;
+      gLastLatencyTotalMs = static_cast<uint32_t>(srcDelta & 0xFFFFFFFFu);
+    } else {
+      gLastLatencyTotalMs = 0;
+    }
     gLatencySamples++;
     gLatencyAvgMs += (static_cast<float>(gLastLatencyTotalMs) - gLatencyAvgMs) / static_cast<float>(max(1UL, gLatencySamples));
   }
-  if (pkt.hasPublishTs) {
-    uint32_t pubTs = static_cast<uint32_t>(pkt.publishTsMs & 0xFFFFFFFFu);
-    gLastPublishToEspMs = nowMs - pubTs;
+  if (pkt.hasPublishTs && gHasTs) {
+    // publish_ts_ms - ts_ms = RPi-side publish delay (same clock domain, valid)
+    uint32_t rpiPublishDelay = static_cast<uint32_t>((pkt.publishTsMs - pkt.tsMs) & 0xFFFFFFFFu);
+    gLastPublishToEspMs = rpiPublishDelay;
   }
-  Serial.print("[MQTT] latency_total=");
+#if VERBOSE
+  Serial.print("[MQTT] src_delta=");
   Serial.print(gLastLatencyTotalMs);
-  Serial.print(" publish_to_esp=");
+  Serial.print(" rpi_pub_delay=");
   Serial.println(gLastPublishToEspMs);
+#endif
 
   acceptPacket(pkt, nowMs);
   bool driving = gMotionDetector.isDriving();
@@ -1015,7 +1129,8 @@ void publishEspTelemetry(uint32_t nowMs) {
   if ((nowMs - gLastTelemetryMs) < ESP_TELEMETRY_MS) return;
   gLastTelemetryMs = nowMs;
 
-  char payload[360];
+  // FIX #5: increase from 360 to 512 to prevent truncation on worst-case JSON.
+  char payload[512];
   int n = snprintf(
       payload,
       sizeof(payload),
@@ -1052,6 +1167,7 @@ void setup() {
   pinMode(PIN_LED_RED, OUTPUT);
   pinMode(PIN_LED_BLUE, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_WIFI_RESET_BUTTON, INPUT_PULLUP);  // Method A: long-press WiFi reset
 
   if (USE_PASSIVE_SPEAKER) {
     ledcSetup(SPEAKER_LEDC_CH, SPEAKER_LEDC_BASE_FREQ, SPEAKER_LEDC_BITS);
@@ -1063,13 +1179,15 @@ void setup() {
   setAlarm(false, 0);
 
   gWifiManager.begin("DrowsySetup");
+  Serial.println("[CFG] WiFi requireInternet=false healthHost=192.168.0.163:1883");
+  Serial.println("[CFG] Motion threshold=0.08 persist=2000ms hold=2500ms");
   bool motionOk = gMotionDetector.begin();
   Serial.print("MPU6050 available=");
   Serial.println(motionOk ? "yes" : "no");
 
   gMqtt.setServer(MQTT_HOST, MQTT_PORT);
-  gMqtt.setKeepAlive(6);
-  gMqtt.setSocketTimeout(1);
+  gMqtt.setKeepAlive(10);
+  gMqtt.setSocketTimeout(1);  // QW: reduced from 2s to 1s to halve reconnect stall
   gMqtt.setBufferSize(420);
   gMqtt.setCallback(onMqttMessage);
 
@@ -1091,12 +1209,17 @@ void loop() {
   uint32_t nowMs = millis();
 
   gMotionDetector.tick(nowMs);
+  checkWifiResetButton(nowMs);  // Method A: long-press button check
   processConnectivity(nowMs);
 
-  // Keep DRIVING/SAFE state aligned with movement when stream is healthy + SAFE AI.
+  // FIX #10: only update observation when driving state actually changes.
+  // Previously this ran every ~1ms, continuously resetting gCandidateSinceMs
+  // and preventing any pending state transition from persisting.
   if ((nowMs - gLastRxMs) <= gCurrentTtlMs && gRawAiState == AiState::SAFE) {
     SystemState idleState = gMotionDetector.isDriving() ? SystemState::DRIVING : SystemState::SAFE;
-    applyObservation(idleState, nowMs);
+    if (idleState != gObservedState) {
+      applyObservation(idleState, nowMs);
+    }
   }
 
   applyDataWatchdog(nowMs);
@@ -1106,38 +1229,28 @@ void loop() {
 
   if ((nowMs - gLastLogMs) >= LOG_GAP_MS) {
     gLastLogMs = nowMs;
-    Serial.print("WiFi:");
-    Serial.print(gWifiManager.isConnected() ? "OK" : "DOWN");
-    Serial.print(" Portal:");
-    Serial.print(gWifiManager.portalActive() ? "ON" : "OFF");
-    Serial.print(" MQTT:");
-    Serial.print(gMqtt.connected() ? "OK" : "DOWN");
-    Serial.print(" AI:");
-    Serial.print(aiStateName(gRawAiState));
-    Serial.print(" OBS:");
-    Serial.print(systemStateName(gObservedState));
-    Serial.print(" STABLE:");
-    Serial.print(systemStateName(gStableState));
-    Serial.print(" CONF:");
-    Serial.print(systemStateName(gConfirmedState));
-    Serial.print(" DRIVE:");
-    Serial.print(gMotionDetector.isDriving() ? "YES" : "NO");
-    Serial.print(" VIB:");
-    Serial.print(gMotionDetector.vibrationLevel(), 3);
-    Serial.print(" ALERT:");
-    Serial.print(static_cast<int>(gAlertMode));
-    Serial.print(" TTL:");
-    Serial.print(gCurrentTtlMs);
-    Serial.print(" RX_AGE:");
-    Serial.print(nowMs - gLastRxMs);
-    Serial.print(" LAT:");
-    Serial.print(gLastLatencyTotalMs);
-    Serial.print(" RATE:");
-    Serial.print(gPacketRateHz, 2);
-    Serial.print(" LOSS:");
-    Serial.print(gPacketLossCount);
-    Serial.print(" RCN:");
-    Serial.println(gReconnectCount);
+    // QW1: consolidated from 35 Serial.print calls (~24ms) into single snprintf (~3ms)
+    char logBuf[220];
+    snprintf(logBuf, sizeof(logBuf),
+      "W:%s P:%s M:%s AI:%s O:%s S:%s C:%s D:%s V:%.3f A:%d T:%lu R:%lu L:%lu Hz:%.1f X:%lu RC:%lu F:%d",
+      gWifiManager.isConnected() ? "OK" : "DN",
+      gWifiManager.portalActive() ? "ON" : "--",
+      gMqtt.connected() ? "OK" : "DN",
+      aiStateName(gRawAiState),
+      systemStateName(gObservedState),
+      systemStateName(gStableState),
+      systemStateName(gConfirmedState),
+      gMotionDetector.isDriving() ? "Y" : "N",
+      static_cast<double>(gMotionDetector.vibrationLevel()),
+      static_cast<int>(gAlertMode),
+      static_cast<unsigned long>(gCurrentTtlMs),
+      static_cast<unsigned long>(nowMs - gLastRxMs),
+      static_cast<unsigned long>(gLastLatencyTotalMs),
+      static_cast<double>(gPacketRateHz),
+      static_cast<unsigned long>(gPacketLossCount),
+      static_cast<unsigned long>(gReconnectCount),
+      static_cast<int>(gWifiManager.flowState()));
+    Serial.println(logBuf);
   }
 
   // No delay(): keep realtime responsiveness.

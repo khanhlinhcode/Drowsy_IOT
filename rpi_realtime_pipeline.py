@@ -18,10 +18,12 @@ MQTT protocol:
 """
 
 from __future__ import annotations
-
 import argparse
 import json
 import logging
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
 import random
 import signal
 import threading
@@ -31,10 +33,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import cv2
+cv2.setNumThreads(1)
 import numpy as np
 import paho.mqtt.client as mqtt
-import os
-import resource
 import psutil  # pip install psutil
 
 
@@ -76,13 +77,16 @@ def clamp100(v: int) -> int:
         return 100
     return int(v)
 _rate_limit_cache = {}
+_rate_limit_lock = threading.Lock()
 
 def rate_limited_log(log, level: str, key: str, msg: str, interval_ms: int = 2000):
     now = monotonic_ms()
-    last = _rate_limit_cache.get(key, 0)
-    if (now - last) > interval_ms:
+    with _rate_limit_lock:
+        last = _rate_limit_cache.get(key, 0)
+        if (now - last) <= interval_ms:
+            return
         _rate_limit_cache[key] = now
-        getattr(log, level)(msg)
+    getattr(log, level)(msg)
 
 @dataclass(frozen=True)
 class MqttConfig:
@@ -96,8 +100,9 @@ class MqttConfig:
     retain: bool = True
     topic_status: str = "driver/status"
     topic_meta: str = "driver/status_meta"
-    min_interval_ms: int = 100
+    min_interval_ms: int = 120
     heartbeat_interval_ms: int = 300
+
     retry_base_ms: int = 250
     retry_max_ms: int = 5000
     ttl_ms: int = 3000
@@ -106,23 +111,29 @@ class MqttConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
+    frame_width: int = 224
+    frame_height: int = 224
+    camera_fps: int = 20
+
+    infer_interval_ms: int = 75
+    infer_interval_min_ms: int = 65
+    infer_interval_max_ms: int = 145
+
+    window_size: int = 14
+
+    sleepy_persist_ms: int = 2600
+    recovery_fatigue_threshold: int = 30
+    min_confidence_gate: float = 0.30
+
     camera_source: Union[int, str] = 0
-    frame_width: int = 320
-    frame_height: int = 240
-    camera_fps: int = 30
     camera_reopen_backoff_ms: int = 700
-    # CRITICAL: stale frames above 200ms are discarded to remove perceptible jitter.
     stale_frame_ms: int = 200
-    infer_interval_ms: int = 85
-    infer_interval_min_ms: int = 60
-    infer_interval_max_ms: int = 140
-    window_size: int = 12
+    # Separate, higher threshold for state engine latency filter.
+    # stale_frame_ms (200ms) is too aggressive for state loop on RPi.
+    state_latency_limit_ms: int = 800
     sleep_ratio_threshold: float = 0.60
     sleepy_ratio_threshold: float = 0.52
     tired_ratio_threshold: float = 0.35
-    sleepy_persist_ms: int = 3000
-    recovery_fatigue_threshold: int = 30
-    min_confidence_gate: float = 0.28
     render_every_n: int = 2
 
 
@@ -132,8 +143,8 @@ class InferencePacket:
     ts_ms: int
     capture_ts_ms: int
     infer_done_ts_ms: int
-    raw: RawRisk
-
+    raw: "RawRisk"
+    
 
 @dataclass
 class FramePacket:
@@ -238,7 +249,12 @@ class FrameGrabber:
             return
         self._last_open_try_ms = now
 
-        cap = cv2.VideoCapture(self._cfg.camera_source)
+        cap = cv2.VideoCapture(self._cfg.camera_source, cv2.CAP_V4L2)
+        if not cap or not cap.isOpened():
+            if cap:
+                cap.release()
+            cap = cv2.VideoCapture(self._cfg.camera_source)  # fallback CAP_ANY
+
         if not cap or not cap.isOpened():
             self._log.warning("Camera open failed source=%s", self._cfg.camera_source)
             if cap:
@@ -250,6 +266,14 @@ class FrameGrabber:
         cap.set(cv2.CAP_PROP_FPS, self._cfg.camera_fps)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        except Exception:
+            pass
+        try:
+            cap.set(cv2.CAP_PROP_FPS, min(self._cfg.camera_fps, 20))
         except Exception:
             pass
 
@@ -323,7 +347,59 @@ class BaseVisionEngine:
     def analyze(self, frame: np.ndarray, now_ms: int) -> RawRisk:
         raise NotImplementedError
 
+class TFLiteVisionEngine(BaseVisionEngine):
+    def __init__(self, model_path: str, log: logging.Logger):
+        import tflite_runtime.interpreter as tflite  # lazy import for graceful fallback
 
+        self._log = log
+        self._interpreter = tflite.Interpreter(
+            model_path=model_path,
+            num_threads=2
+        )
+        self._interpreter.allocate_tensors()
+
+        self._input_details = self._interpreter.get_input_details()
+        self._output_details = self._interpreter.get_output_details()
+
+        self._h = self._input_details[0]['shape'][1]
+        self._w = self._input_details[0]['shape'][2]
+
+        self._log.info(f"[TFLite] loaded {model_path}")
+
+    def analyze(self, frame: np.ndarray, now_ms: int) -> RawRisk:
+        try:
+            img = cv2.resize(frame, (self._w, self._h))
+            img = img.astype(np.float32) / 255.0
+            img = np.expand_dims(img, axis=0)
+
+            self._interpreter.set_tensor(self._input_details[0]['index'], img)
+            self._interpreter.invoke()
+
+            out = self._interpreter.get_tensor(
+                self._output_details[0]['index']
+            )[0]
+
+            if len(out) < 4:
+                return RawRisk(1,0,0,0,0,0)
+
+            p_safe, p_tired, p_sleepy, p_sleep = out[:4]
+
+            conf = max(out)
+            fatigue = int(p_tired*40 + p_sleepy*70 + p_sleep*100)
+
+            return RawRisk(
+                p_safe=float(p_safe),
+                p_tired=float(p_tired),
+                p_sleepy=float(p_sleepy),
+                p_sleep=float(p_sleep),
+                confidence=float(conf),
+                fatigue_hint=clamp100(fatigue)
+            )
+
+        except Exception as e:
+            self._log.error(f"[TFLite] error {e}")
+            return RawRisk(1,0,0,0,0,0)
+        
 class MediaPipeVisionEngine(BaseVisionEngine):
     """Face + attention based drowsiness inference using MediaPipe FaceMesh."""
 
@@ -342,7 +418,7 @@ class MediaPipeVisionEngine(BaseVisionEngine):
         self._mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
@@ -649,7 +725,9 @@ class StatePersistence:
             if self._sleepy_since_ms is None:
                 self._sleepy_since_ms = now_ms
             if (now_ms - self._sleepy_since_ms) >= self._sleepy_persist_ms:
-                self._sleepy_since_ms = None
+                # FIX #4: Do NOT reset _sleepy_since_ms here. Resetting causes
+                # SLEEPY to flicker on/off every sleepy_persist_ms cycle.
+                # Keep timer running to maintain SLEEPY as long as candidate persists.
                 self._last_output = SIG_SLEEPY
                 return self._last_output
             # Before persistence threshold, degrade to TIRED.
@@ -740,8 +818,9 @@ class MqttPublisher:
             bench=None,
         )
         with self._lock:
-            # FIX: suppress exact duplicates in pending/last state.
+            # FIX #8: update timestamp even for duplicate signal+fatigue (consistent with offer_with_latency).
             if self._pending is not None and self._pending.signal == event.signal and self._pending.fatigue == event.fatigue:
+                self._pending = event
                 return
             if self._last_sent is not None and self._last_sent.signal == event.signal and self._last_sent.fatigue == event.fatigue:
                 self._pending = event
@@ -978,6 +1057,14 @@ class RealtimePipeline:
         self._state_thread: Optional[threading.Thread] = None
 
         self._infer_interval_ms = p_cfg.infer_interval_ms
+        # Raspberry Pi optimization default
+        if self._cfg.camera_fps > 20:
+            self._infer_interval_ms = max(self._infer_interval_ms, 90)
+
+        self._infer_interval_ms = max(
+            self._cfg.infer_interval_min_ms,
+            min(self._cfg.infer_interval_max_ms, self._infer_interval_ms),
+        )
         self._infer_count = 0
         self._infer_mark_ms = monotonic_ms()
         self._infer_fps = 0.0
@@ -988,6 +1075,8 @@ class RealtimePipeline:
         self._infer_seq = 0
 
         # FIX: separate state lock for state machine/UI readback.
+        # Also protects _infer_interval_ms to avoid data race between
+        # inference thread and watchdog thread (Bug #2).
         self._state_lock = state_lock
         self._latest_state: Optional[SmoothedRisk] = None
         self._last_signal = SIG_SAFE
@@ -1012,8 +1101,9 @@ class RealtimePipeline:
         self._confirmed_signal = SIG_SAFE
         self._confirm_candidate = SIG_SAFE
         self._confirm_since_ms = monotonic_ms()
-        self._confirm_hold_ms = 180
-
+        self._confirm_hold_ms = 500
+        self._stale_streak = 0
+        self._start_ms = monotonic_ms()  # FIX #9: track startup time for watchdog grace period
         self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
 
     def start(self) -> None:
@@ -1036,11 +1126,6 @@ class RealtimePipeline:
             self._state_thread.join(timeout=1.5)
         self._mqtt.stop()
         self._camera.stop()
-        if self._preview:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
         self._log.info("Pipeline stopped")
 
     def request_stop(self) -> None:
@@ -1068,8 +1153,8 @@ class RealtimePipeline:
 
             frame_age = now - packet.ts_ms
             if frame_age > self._cfg.stale_frame_ms:
-                stale_streak = getattr(self, "_stale_streak", 0) + 1
-                self._stale_streak = stale_streak
+                self._stale_streak += 1
+                stale_streak = self._stale_streak
 
                 if stale_streak % 10 == 0:
                     rate_limited_log(self._log, "warning", "stale_frame", f"[CAM] stale x{stale_streak} age={frame_age}ms")
@@ -1105,12 +1190,13 @@ class RealtimePipeline:
             infer_done_ms = monotonic_ms()
             infer_cost = infer_done_ms - infer_start
 
-            # FIX: clamp inference cadence between 60..140ms.
-            if infer_cost > 118:
-                self._infer_interval_ms = min(self._cfg.infer_interval_max_ms, self._infer_interval_ms + 8)
-            elif infer_cost < 74:
-                self._infer_interval_ms = max(self._cfg.infer_interval_min_ms, self._infer_interval_ms - 3)
-            self._infer_interval_ms = max(self._cfg.infer_interval_min_ms, min(self._cfg.infer_interval_max_ms, self._infer_interval_ms))
+            # FIX #2: protect _infer_interval_ms with state_lock (shared with watchdog).
+            with self._state_lock:
+                if infer_cost > 118:
+                    self._infer_interval_ms = min(self._cfg.infer_interval_max_ms, self._infer_interval_ms + 8)
+                elif infer_cost < 74:
+                    self._infer_interval_ms = max(self._cfg.infer_interval_min_ms, self._infer_interval_ms - 3)
+                self._infer_interval_ms = max(self._cfg.infer_interval_min_ms, min(self._cfg.infer_interval_max_ms, self._infer_interval_ms))
             next_infer_ms = now + self._infer_interval_ms
             last_frame_ts = packet.ts_ms
 
@@ -1140,17 +1226,18 @@ class RealtimePipeline:
                 time.sleep(0.01)
 
     def _confirm_state(self, candidate_signal: int, now_ms: int) -> int:
-        if candidate_signal == self._confirmed_signal:
-            self._confirm_candidate = candidate_signal
-            self._confirm_since_ms = now_ms
+        with self._state_lock:
+            if candidate_signal == self._confirmed_signal:
+                # FIX #5: no need to reset timer when already confirmed.
+                self._confirm_candidate = candidate_signal
+                return self._confirmed_signal
+            if candidate_signal != self._confirm_candidate:
+                self._confirm_candidate = candidate_signal
+                self._confirm_since_ms = now_ms
+                return self._confirmed_signal
+            if (now_ms - self._confirm_since_ms) >= self._confirm_hold_ms:
+                self._confirmed_signal = candidate_signal
             return self._confirmed_signal
-        if candidate_signal != self._confirm_candidate:
-            self._confirm_candidate = candidate_signal
-            self._confirm_since_ms = now_ms
-            return self._confirmed_signal
-        if (now_ms - self._confirm_since_ms) >= self._confirm_hold_ms:
-            self._confirmed_signal = candidate_signal
-        return self._confirmed_signal
 
     def _bench_snapshot(self, now_ms: int, fatigue: int) -> dict:
         with self._state_lock:
@@ -1162,6 +1249,17 @@ class RealtimePipeline:
             dropped_pct = (self._dropped_frames * 100.0) / float(frames_seen)
             latency_avg = 0.0 if self._latency_count <= 0 else (self._latency_sum_ms / self._latency_count)
             signal_value = self._last_signal
+
+            # FIX M-1: reset rolling counters after snapshot so averages
+            # reflect recent window, not entire uptime history.
+            self._infer_cost_sum = 0.0
+            self._infer_cost_count = 0
+            self._infer_cost_min = 10**9
+            self._infer_cost_max = 0
+            self._latency_sum_ms = 0
+            self._latency_count = 0
+            self._frames_seen = 0
+            self._dropped_frames = 0
 
         metric_roll = Metrics(
             fps=float(self._infer_fps),
@@ -1223,15 +1321,19 @@ class RealtimePipeline:
                 elif 10 <= phase < 14:
                     final_signal = SIG_SLEEPY
 
-            final_signal = self._confirm_state(final_signal, now)
-
-            # CRITICAL: explicit recovery latch clear to avoid stuck DROWSY/TIRED.
+            # FIX #12: recovery check BEFORE _confirm_state so it goes through
+            # the confirmation hold (180ms) instead of bypassing it.
             if smooth.ratio_safe >= 0.72 and smooth.fatigue <= self._cfg.recovery_fatigue_threshold:
                 final_signal = SIG_SAFE
                 self._persist.resolve(SIG_SAFE, smooth.fatigue, now)
 
+            final_signal = self._confirm_state(final_signal, now)
+
+            # FIX #6: use separate state_latency_limit_ms (800ms) instead of
+            # stale_frame_ms (200ms). On RPi, inference alone can take 80-120ms,
+            # so 200ms threshold drops most valid results.
             total_latency = max(0, now - pkt.capture_ts_ms)
-            if total_latency > self._cfg.stale_frame_ms:
+            if total_latency > self._cfg.state_latency_limit_ms:
                 rate_limited_log(self._log, "warning", "latency_drop", f"[STATE] drop latency={total_latency}ms")
                 continue
             with self._state_lock:
@@ -1261,9 +1363,13 @@ class RealtimePipeline:
                     self._render_preview(final_signal)
     def _watchdog_loop(self):
         while not self._stop.is_set():
+            now = monotonic_ms()
+            uptime_ms = now - self._start_ms
             fps = self._camera.capture_fps()
 
-            if fps < 5:
+            # FIX #9: skip low-fps check during startup grace period (5s)
+            # to avoid spurious reopen when fps counter hasn't warmed up yet.
+            if fps < 5 and uptime_ms > 5000:
                 rate_limited_log(self._log, "warning", "low_fps", "[WATCHDOG] low camera fps")
                 self._camera.request_reopen()
 
@@ -1273,8 +1379,27 @@ class RealtimePipeline:
             process = psutil.Process(os.getpid())
             mem_mb = process.memory_info().rss / (1024 * 1024)
 
-            if mem_mb > 500:
+            if mem_mb > 320:
                 rate_limited_log(self._log, "warning", "mem", f"[WATCHDOG] memory high {mem_mb:.1f}MB")
+            if mem_mb > 420:
+                rate_limited_log(self._log, "error", "mem_crit", f"[WATCHDOG] memory CRITICAL {mem_mb:.1f}MB")
+
+            cpu = psutil.cpu_percent(interval=0.1)
+            if cpu > 85:
+                rate_limited_log(self._log, "warning", "cpu", f"[WATCHDOG] CPU high {cpu}%")
+                # FIX #2: protect _infer_interval_ms with state_lock
+                with self._state_lock:
+                    self._infer_interval_ms = min(self._cfg.infer_interval_max_ms, self._infer_interval_ms + 10)
+
+            # FIX #17: read latency metrics under state_lock
+            with self._state_lock:
+                latency_avg = self._latency_sum_ms / max(1, self._latency_count)
+            rate_limited_log(
+                self._log,
+                "info",
+                "perf",
+                f"[PERF] FPS={self._infer_fps:.1f} latency_avg={latency_avg:.1f}ms"
+            )
 
             time.sleep(2)
 
@@ -1321,8 +1446,11 @@ class RealtimePipeline:
         c = tuple(int(x) for x in self._ui_color)
         cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), c, -1)
         cv2.putText(frame, STATUS_TEXT.get(signal_value, "ATTENTIVE"), (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (16, 16, 16), 2)
-        cv2.imshow("Drowsy Preview", frame)
-        cv2.waitKey(1)
+        try:
+            cv2.imshow("Drowsy Preview", frame)
+            cv2.waitKey(1)
+        except Exception:
+            pass
 
     def _maybe_log(self, now_ms: int) -> None:
         if (now_ms - self._last_log_ms) < 1000:
@@ -1355,7 +1483,7 @@ class RealtimePipeline:
             self._last_metrics_dump_ms = now_ms
             payload = self._bench_snapshot(now_ms, smooth.fatigue)
             payload["status"] = STATUS_TEXT.get(sig, "ATTENTIVE")
-            payload["mqtt_connected"] = True
+            payload["mqtt_connected"] = self._mqtt.is_connected()
             try:
                 with open(self._metrics_file, "w", encoding="utf-8") as f:
                     json.dump(payload, f, separators=(",", ":"))
@@ -1372,15 +1500,18 @@ def parse_camera_source(raw: str) -> Union[int, str]:
 
 
 def build_engine(log: logging.Logger) -> BaseVisionEngine:
+    # FIX #13: lazy import tflite_runtime so missing package doesn't crash at startup.
     try:
-        engine = MediaPipeVisionEngine(log)
-        log.info("Using MediaPipe vision engine")
-        return engine
-    except Exception as exc:
-        log.warning("MediaPipe unavailable (%s), using heuristic fallback", exc)
-        return HeuristicVisionEngine()
-
-
+        import tflite_runtime.interpreter as tflite  # noqa: F811
+        return TFLiteVisionEngine("model.tflite", log)
+    except Exception as e:
+        log.warning("TFLite failed → fallback: %s", e)
+        try:
+            return MediaPipeVisionEngine(log)
+        except Exception as e2:
+            log.warning("MediaPipe failed → HeuristicVisionEngine fallback: %s", e2)
+            return HeuristicVisionEngine()
+        
 def build_logger(verbose: bool) -> logging.Logger:
     log = logging.getLogger("rpi-drowsy-pipeline")
     if not log.handlers:
@@ -1404,30 +1535,71 @@ def main() -> None:
     parser.add_argument("--mqtt-pass", default=None)
     parser.add_argument("--topic-status", default="driver/status")
     parser.add_argument("--topic-meta", default="driver/status_meta")
-    parser.add_argument("--min-pub-ms", type=int, default=100)
+    parser.add_argument("--min-pub-ms", type=int, default=120)
     parser.add_argument("--ttl-ms", type=int, default=3000)
 
     parser.add_argument("--sleepy-ms", type=int, default=3000, help="Sleepy persistence ms")
-    parser.add_argument("--preview", action="store_true", help="Show local preview window")
+    parser.add_argument("--no-preview", dest="preview", action="store_false", default=True, help="Disable local preview window")
     parser.add_argument("--demo-mode", action="store_true", help="Enable demo instability + simulated events")
     parser.add_argument("--metrics-file", default="/tmp/drowsy_metrics.json")
     parser.add_argument("--dashboard", action="store_true", help="Run local dashboard server")
     parser.add_argument("--dashboard-port", type=int, default=8088)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=["smooth", "fast"],
+        default="smooth",
+        help="smooth: stable demo, fast: quicker alert response",
+    )
     args = parser.parse_args()
 
     log = build_logger(args.verbose)
-
-    min_pub = max(100, int(args.min_pub_ms))
+    log.info("Profile=%s", args.profile)
     ttl_ms = max(1200, int(args.ttl_ms))
-    sleepy_ms = max(3000, int(args.sleepy_ms))
+
+    # Profile presets
+
+    if args.profile == "fast":
+        p_infer_ms = 65
+        p_infer_min = 55
+        p_infer_max = 120
+        p_window = 10
+        p_sleepy_ms = 1800
+        p_recovery = 35
+        p_conf_gate = 0.26
+        m_min_pub = 100
+        m_heartbeat = 250
+    else:  # smooth
+        p_infer_ms = 75
+        p_infer_min = 65
+        p_infer_max = 145
+        p_window = 14
+        p_sleepy_ms = 2600
+        p_recovery = 18
+        p_conf_gate = 0.30
+        m_min_pub = 120
+        m_heartbeat = 300
+
+
+
+    # Optional sleepy-ms override
+    if int(args.sleepy_ms) != 3000:
+        sleepy_ms = max(1000, int(args.sleepy_ms))
+    else:
+        sleepy_ms = p_sleepy_ms
 
     p_cfg = PipelineConfig(
         camera_source=parse_camera_source(args.camera),
         frame_width=int(args.width),
         frame_height=int(args.height),
         camera_fps=int(args.fps),
+        infer_interval_ms=p_infer_ms,
+        infer_interval_min_ms=p_infer_min,
+        infer_interval_max_ms=p_infer_max,
+        window_size=p_window,
         sleepy_persist_ms=sleepy_ms,
+        recovery_fatigue_threshold=p_recovery,
+        min_confidence_gate=p_conf_gate,
     )
     m_cfg = MqttConfig(
         broker=args.mqtt_host,
@@ -1436,8 +1608,8 @@ def main() -> None:
         password=args.mqtt_pass,
         topic_status=args.topic_status,
         topic_meta=args.topic_meta,
-        min_interval_ms=min_pub,
-        heartbeat_interval_ms=300,
+        min_interval_ms=max(m_min_pub, int(args.min_pub_ms)),
+        heartbeat_interval_ms=m_heartbeat,
         ttl_ms=ttl_ms,
         demo_mode=bool(args.demo_mode),
     )
@@ -1452,10 +1624,10 @@ def main() -> None:
         metrics_file=args.metrics_file,
     )
 
+
     if args.dashboard:
         try:
             from realtime_dashboard import start_dashboard_server
-
             start_dashboard_server(
                 metrics_file=args.metrics_file,
                 mqtt_host=args.mqtt_host,
@@ -1475,14 +1647,18 @@ def main() -> None:
 
     pipeline.run_forever()
 
-
 def run_with_restart():
+    backoff = 2
     while True:
         try:
             main()
+            # FIX #10: normal return from main() means intentional shutdown
+            # (e.g. SIGINT/SIGTERM). Don't restart.
+            break
         except Exception as e:
             print("[FATAL] restarting:", e)
-            time.sleep(2)
+            time.sleep(backoff)
+            backoff = min(20, backoff + 2)
 
 if __name__ == "__main__":
     run_with_restart()

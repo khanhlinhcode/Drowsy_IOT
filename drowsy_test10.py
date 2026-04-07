@@ -6,21 +6,17 @@ Goals:
 - 224x168 low-latency pipeline
 - Adaptive MediaPipe inference with dynamic throttling
 - MQTT QoS1 + heartbeat + reconnect safety
-- ESP32-compatible signal mapping
+- Keep existing fatigue/drowsiness logic behavior
 """
 
-import argparse
 import json
 import math
 import os
-import sys
 import threading
 import time
 from collections import deque
 
 os.environ["OMP_NUM_THREADS"] = "1"
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
 
 import cv2
 import mediapipe as mp
@@ -54,14 +50,14 @@ _options = _mp_tasks.FaceLandmarkerOptions(
 _landmarker = _mp_tasks.FaceLandmarker.create_from_options(_options)
 
 # =========================================================
-# MQTT (defaults overridden by CLI args in main())
+# MQTT
 # =========================================================
-MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
+#MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.0.163")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "172.20.10.2")
 
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = "driver/status"
 MQTT_META_TOPIC = "driver/status_meta"
-MQTT_ALERT_TOPIC = "driver/alert_event"
 
 MQTT_KEEPALIVE_S = 5
 MQTT_STATUS_QOS = 1
@@ -135,7 +131,7 @@ def _init_mqtt():
         print("MQTT connection failed:", exc)
 
 
-# NOTE: _init_mqtt() is called from main() after CLI args are parsed.
+_init_mqtt()
 
 # =========================================================
 # Core constants
@@ -442,14 +438,6 @@ _last_sent_ms = 0
 _last_print_status = ""
 _last_status_log_ms = 0
 
-# Alert event tracking (for driver/alert_event publishing)
-_alert_event_active = False
-_alert_event_id = 0
-_alert_event_start_ms = 0
-_alert_event_trigger = ""
-_alert_event_last_status = ""
-_alert_session_id = f"sess-{int(time.time())}"
-
 _last_out = {
     "status": "NO FACE",
     "fatigue": 0,
@@ -468,7 +456,7 @@ STATUS_SIGNAL = {
     "VERY TIRED": 2,
     "LOOKING LEFT": 1,
     "LOOKING RIGHT": 1,
-    "LOOKING DOWN": 2,
+    "LOOKING DOWN": 1,
     "LOOKING SIDE": 1,
     "HEAD TILT": 1,
     "DISTRACTED": 2,
@@ -476,24 +464,6 @@ STATUS_SIGNAL = {
     "DROWSY": 3,
     "MICROSLEEP": 3,
     "NO FACE": 0,
-}
-
-# Map internal status to text that ESP32 mapStatusTextToAiState() understands.
-STATUS_TO_ESP32_TEXT = {
-    "ATTENTIVE": "ATTENTIVE",
-    "AWAKE": "ATTENTIVE",
-    "TIRED": "TIRED",
-    "VERY TIRED": "SLEEPY",
-    "DROWSY": "MICROSLEEP",
-    "MICROSLEEP": "MICROSLEEP",
-    "HEAD DOWN": "MICROSLEEP",
-    "DISTRACTED": "SLEEPY",
-    "LOOKING DOWN": "LOOKING DOWN",
-    "LOOKING LEFT": "TIRED",
-    "LOOKING RIGHT": "TIRED",
-    "LOOKING SIDE": "TIRED",
-    "HEAD TILT": "TIRED",
-    "NO FACE": "ATTENTIVE",
 }
 
 DANGER_STATES = {"DROWSY", "MICROSLEEP", "HEAD DOWN"}
@@ -622,43 +592,39 @@ def _publish_signal(status, signal, fatigue, now_ms):
 
     sig = int(signal)
     fat = int(fatigue)
-    # Translate to text ESP32 understands
-    esp_status = STATUS_TO_ESP32_TEXT.get(status, "ATTENTIVE")
+
+    status_changed = (status != _last_sent) or (sig != _last_sent_signal)
+    should_send = _mqtt_force_sync or status_changed or ((now_ms - _last_sent_ms) >= MQTT_HEARTBEAT_MS)
+    if not should_send:
+        return
+
+    if not _mqtt_connected:
+        if status_changed and (now_ms - _last_mqtt_err_ms) >= MQTT_ERR_LOG_GAP_MS:
+            print("MQTT skip(disconnected):", sig, "| STATUS:", status, "| FATIGUE:", fat)
+            _last_mqtt_err_ms = now_ms
+        return
+
+    _mqtt_seq += 1
+    meta_due = (
+        status != _last_mqtt_meta_status
+        or sig != _last_sent_signal
+        or (now_ms - _last_mqtt_meta_ms) >= MQTT_META_MIN_MS
+    )
+    meta_payload = None
+    if meta_due:
+        meta_payload = json.dumps(
+            {
+                "seq": _mqtt_seq,
+                "ts_ms": now_ms,
+                "status": status,
+                "signal": sig,
+                "fatigue": fat,
+                "ttl_ms": MQTT_STATE_TTL_MS,
+            },
+            separators=(",", ":"),
+        )
 
     with _mqtt_pub_lock:
-        status_changed = (status != _last_sent) or (sig != _last_sent_signal)
-        should_send = _mqtt_force_sync or status_changed or ((now_ms - _last_sent_ms) >= MQTT_HEARTBEAT_MS)
-        if not should_send:
-            return
-
-        if not _mqtt_connected:
-            if status_changed and (now_ms - _last_mqtt_err_ms) >= MQTT_ERR_LOG_GAP_MS:
-                print("MQTT skip(disconnected):", sig, "| STATUS:", status, "| FATIGUE:", fat)
-                _last_mqtt_err_ms = now_ms
-            return
-
-        _mqtt_seq += 1
-        publish_ts_ms = int(time.monotonic() * 1000)
-        meta_due = (
-            status != _last_mqtt_meta_status
-            or sig != _last_sent_signal
-            or (now_ms - _last_mqtt_meta_ms) >= MQTT_META_MIN_MS
-        )
-        meta_payload = None
-        if meta_due:
-            meta_payload = json.dumps(
-                {
-                    "seq": _mqtt_seq,
-                    "ts_ms": now_ms,
-                    "publish_ts_ms": publish_ts_ms,
-                    "status": esp_status,
-                    "signal": sig,
-                    "fatigue": fat,
-                    "ttl_ms": MQTT_STATE_TTL_MS,
-                },
-                separators=(",", ":"),
-            )
-
         try:
             info = mqtt_client.publish(
                 MQTT_TOPIC,
@@ -688,16 +654,16 @@ def _publish_signal(status, signal, fatigue, now_ms):
                 _last_mqtt_err_ms = now_ms
             return
 
-        _last_sent = status
-        _last_sent_signal = sig
-        _last_sent_ms = now_ms
-        _mqtt_force_sync = False
-        if meta_payload is not None:
-            _last_mqtt_meta_ms = now_ms
-            _last_mqtt_meta_status = status
+    _last_sent = status
+    _last_sent_signal = sig
+    _last_sent_ms = now_ms
+    _mqtt_force_sync = False
+    if meta_payload is not None:
+        _last_mqtt_meta_ms = now_ms
+        _last_mqtt_meta_status = status
 
     if status_changed or status != _last_mqtt_log_status or (now_ms - _last_mqtt_log_ms) >= MQTT_LOG_GAP_MS:
-        print("MQTT PUB:", sig, "|", esp_status, "| FATIGUE:", fat)
+        print("MQTT PUB:", sig, "| STATUS:", status, "| FATIGUE:", fat)
         _last_mqtt_log_ms = now_ms
         _last_mqtt_log_status = status
 
@@ -708,82 +674,6 @@ def _log_status(status, fatigue, now_ms):
         print("STATUS:", status, "| FATIGUE:", int(fatigue))
         _last_print_status = status
         _last_status_log_ms = now_ms
-
-
-def _publish_alert_event(status, fatigue, now_ms):
-    """Publish structured alert event to driver/alert_event when entering danger state."""
-    global _alert_event_active, _alert_event_id
-    global _alert_event_start_ms, _alert_event_trigger, _alert_event_last_status
-
-    if mqtt_client is None or not _mqtt_connected:
-        return
-
-    is_danger = status in DANGER_STATES
-    was_danger = _alert_event_last_status in DANGER_STATES
-
-    if is_danger and not was_danger:
-        # Entering danger state — publish alert start event.
-        _alert_event_active = True
-        _alert_event_id += 1
-        _alert_event_start_ms = now_ms
-        _alert_event_trigger = status
-
-        event = {
-            "event_id": f"evt-{_alert_session_id}-{_alert_event_id:04d}",
-            "device_id": "rpi-drowsy-edge",
-            "session_id": _alert_session_id,
-            "event_type": "DROWSY_ALERT",
-            "trigger_status": status,
-            "fatigue_score": int(fatigue),
-            "perclos": round(_perclos.value(), 3),
-            "eye_closed_ms": int(float(now_ms - _eye_start) if _eye_closed and _eye_start > 0 else 0),
-            "head_pose": _last_out.get("head", "CENTER"),
-            "timestamp_ms": now_ms,
-            "duration_ms": 0,
-            "resolved": False,
-        }
-        try:
-            mqtt_client.publish(
-                MQTT_ALERT_TOPIC,
-                payload=json.dumps(event, separators=(",", ":")),
-                qos=1,
-                retain=False,
-            )
-            print(f"ALERT EVENT START: {event['event_id']} trigger={status} fatigue={int(fatigue)}")
-        except Exception as exc:
-            print("ALERT EVENT publish error:", exc)
-
-    elif not is_danger and was_danger and _alert_event_active:
-        # Exiting danger state — publish alert resolved event.
-        _alert_event_active = False
-        duration_ms = max(0, now_ms - _alert_event_start_ms)
-
-        event = {
-            "event_id": f"evt-{_alert_session_id}-{_alert_event_id:04d}",
-            "device_id": "rpi-drowsy-edge",
-            "session_id": _alert_session_id,
-            "event_type": "DROWSY_ALERT_RESOLVED",
-            "trigger_status": _alert_event_trigger,
-            "fatigue_score": int(fatigue),
-            "perclos": round(_perclos.value(), 3),
-            "eye_closed_ms": 0,
-            "head_pose": _last_out.get("head", "CENTER"),
-            "timestamp_ms": now_ms,
-            "duration_ms": duration_ms,
-            "resolved": True,
-        }
-        try:
-            mqtt_client.publish(
-                MQTT_ALERT_TOPIC,
-                payload=json.dumps(event, separators=(",", ":")),
-                qos=1,
-                retain=False,
-            )
-            print(f"ALERT EVENT RESOLVED: {event['event_id']} duration={duration_ms}ms")
-        except Exception as exc:
-            print("ALERT EVENT publish error:", exc)
-
-    _alert_event_last_status = status
 
 
 def _ear_eye(lm, idx):
@@ -1479,7 +1369,6 @@ def process_frame(frame):
 
     _log_status(status, _fatigue, now)
     _publish_signal(status, signal, _fatigue, now)
-    _publish_alert_event(status, _fatigue, now)
     return dict(_last_out), frame
 
 
@@ -1633,37 +1522,16 @@ def _camera_worker_usb(cap, stream_format):
     global _latest_cam_frame, _latest_cam_ts, _latest_cam_seq
     last_cam_err_ms = 0
     last_cam_invalid_ms = 0
-    fail_count = 0
-    CAM_FAIL_REOPEN = 5
 
     while not _stop_event.is_set():
         ok, raw = cap.read()
         if (not ok) or raw is None:
-            fail_count += 1
             now_ms = int(time.monotonic() * 1000)
             if now_ms - last_cam_err_ms > CAM_LOG_GAP_MS:
-                print(f"USB CAMERA READ FAILED (x{fail_count})")
+                print("USB CAMERA READ FAILED")
                 last_cam_err_ms = now_ms
-            if fail_count >= CAM_FAIL_REOPEN:
-                print("[CAM] forcing camera reopen")
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                _stop_event.wait(0.5)
-                new_cap = _open_usb_camera()
-                if new_cap is not None:
-                    cap = new_cap
-                    fail_count = 0
-                    print("[CAM] camera reopened OK")
-                else:
-                    print("[CAM] camera reopen FAILED, retrying...")
-                    _stop_event.wait(1.0)
-                continue
             _stop_event.wait(0.008)
             continue
-
-        fail_count = 0
 
         frame = _normalize_camera_frame(raw, stream_format)
         if not _is_valid_color_frame(frame):
@@ -1912,58 +1780,13 @@ def _display_loop():
         ui_tick += 1
 
         last_rendered_frame = frame
-        try:
-            cv2.imshow("Drowsiness Edge", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                _stop_event.set()
-                break
-        except Exception:
-            pass
-
-
-def _headless_loop():
-    """Run without display window (SSH / headless Pi)."""
-    import signal as _sig
-
-    def _handle_stop(_s, _f):
-        _stop_event.set()
-
-    _sig.signal(_sig.SIGINT, _handle_stop)
-    _sig.signal(_sig.SIGTERM, _handle_stop)
-
-    while not _stop_event.is_set():
-        _stop_event.wait(0.1)
+        cv2.imshow("Drowsiness Edge", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            _stop_event.set()
+            break
 
 
 def main():
-    global MQTT_BROKER, MQTT_PORT
-    global USB_CAMERA_SOURCE, USB_CAMERA_WIDTH, USB_CAMERA_HEIGHT, USB_CAMERA_FPS
-
-    parser = argparse.ArgumentParser(description="Drowsiness Edge Detection — RPi4 + ESP32")
-    parser.add_argument("--camera", default="0", help="Camera source (default: 0)")
-    parser.add_argument("--mqtt-host", default=None, help="MQTT broker host (default: 127.0.0.1)")
-    parser.add_argument("--mqtt-port", type=int, default=None, help="MQTT broker port (default: 1883)")
-    parser.add_argument("--width", type=int, default=224, help="Frame width (default: 224)")
-    parser.add_argument("--height", type=int, default=168, help="Frame height (default: 168)")
-    parser.add_argument("--fps", type=int, default=30, help="Camera FPS target (default: 30)")
-    parser.add_argument("--no-preview", dest="preview", action="store_false", default=True,
-                        help="Disable preview window (headless mode)")
-    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
-    args = parser.parse_args()
-
-    # Apply CLI overrides
-    USB_CAMERA_SOURCE = args.camera
-    USB_CAMERA_WIDTH = args.width
-    USB_CAMERA_HEIGHT = args.height
-    USB_CAMERA_FPS = args.fps
-    if args.mqtt_host is not None:
-        MQTT_BROKER = args.mqtt_host
-    if args.mqtt_port is not None:
-        MQTT_PORT = args.mqtt_port
-
-    # Init MQTT after CLI args are applied
-    _init_mqtt()
-
     camera = _open_usb_camera()
     if camera is None:
         print(f"Camera init failed: cannot open USB camera source '{USB_CAMERA_SOURCE}'")
@@ -1974,8 +1797,6 @@ def main():
         f"USB source={USB_CAMERA_SOURCE} api={USB_CAMERA_API} "
         f"target={USB_CAMERA_WIDTH}x{USB_CAMERA_HEIGHT}@{USB_CAMERA_FPS}"
     )
-    print(f"MQTT broker={MQTT_BROKER}:{MQTT_PORT}")
-    print(f"Preview={'ON' if args.preview else 'OFF (headless)'}")
 
     try:
         actual_w = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1988,7 +1809,9 @@ def main():
     if actual_w > 0 and actual_h > 0:
         print(f"USB active mode: {actual_w}x{actual_h}@{actual_fps:.1f}")
 
-    print("Press q to quit" if args.preview else "Press Ctrl+C to quit")
+    print("Camera backend: usb")
+    print(f"Camera stream format: {stream_format} | color_order={CAMERA_COLOR_ORDER}")
+    print("Press q to quit")
 
     cam_thread = threading.Thread(
         target=_camera_worker_usb,
@@ -2003,10 +1826,7 @@ def main():
     mqtt_thread.start()
 
     try:
-        if args.preview:
-            _display_loop()
-        else:
-            _headless_loop()
+        _display_loop()
     finally:
         _stop_event.set()
         _new_frame_event.set()
@@ -2015,7 +1835,6 @@ def main():
         proc_thread.join(timeout=1.5)
         mqtt_thread.join(timeout=1.0)
 
-        # Send SAFE signal to ESP32 before disconnecting
         try:
             if mqtt_client is not None:
                 mqtt_client.publish(MQTT_TOPIC, "0", qos=MQTT_STATUS_QOS, retain=False)
@@ -2030,11 +1849,7 @@ def main():
             camera.release()
         except Exception:
             pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-        print("Shutdown complete.")
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

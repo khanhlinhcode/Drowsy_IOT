@@ -58,10 +58,16 @@ void MotionDetector::tick(uint32_t nowMs) {
   float ay = 0.0f;
   float az = 0.0f;
   if (!readAccel(ax, ay, az)) {
-    _available = false;
-    _driving = true;
+    // FIX #11: tolerate transient I2C failures (bus busy, noise, clock stretch).
+    // Only mark unavailable after READ_FAIL_LIMIT consecutive failures.
+    _readFailCount++;
+    if (_readFailCount >= READ_FAIL_LIMIT) {
+      _available = false;
+      _driving = true;
+    }
     return;
   }
+  _readFailCount = 0;
 
   float mag = sqrtf((ax * ax) + (ay * ay) + (az * az));
   if (!_hasBaseline) {

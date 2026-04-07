@@ -384,18 +384,31 @@ class MqttService {
   }
 
   SleepState? _stateFromJson(Map<String, dynamic> jsonMap) {
-    final stateRaw = jsonMap['state'];
+    final stateRaw = jsonMap['state'] ?? jsonMap['status'] ?? jsonMap['trigger_status'];
+    final signalRaw = jsonMap['signal'];
 
-    if (stateRaw is String && SleepStateX.isValidRaw(stateRaw)) {
-      return SleepStateX.fromRaw(stateRaw);
+    if (signalRaw is num) {
+      return _stateFromNumericCode(signalRaw.toInt());
+    }
+    if (signalRaw is String) {
+      final parsed = int.tryParse(signalRaw);
+      if (parsed != null) return _stateFromNumericCode(parsed);
+    }
+
+    if (stateRaw is String) {
+      final s = stateRaw.trim().toUpperCase();
+      if (s == 'MICROSLEEP' || s == 'SLEEP' || s == 'DROWSY' || s == 'HEAD DOWN') return SleepState.sleep;
+      if (s == 'SLEEPY' || s == 'TIRED' || s == 'VERY TIRED' || s == 'DISTRACTED' || s == 'LOOKING DOWN' || s == 'LOOKING LEFT' || s == 'LOOKING RIGHT' || s == 'HEAD TILT' || s == 'LOOKING SIDE') return SleepState.sleepy;
+      if (s == 'NORMAL' || s == 'ATTENTIVE' || s == 'AWAKE' || s == 'NO FACE') return SleepState.normal;
+
+      if (SleepStateX.isValidRaw(stateRaw)) {
+        return SleepStateX.fromRaw(stateRaw);
+      }
+      return _stateFromNumericCode(int.tryParse(stateRaw));
     }
 
     if (stateRaw is num) {
       return _stateFromNumericCode(stateRaw.toInt());
-    }
-
-    if (stateRaw is String) {
-      return _stateFromNumericCode(int.tryParse(stateRaw));
     }
 
     return null;
@@ -421,21 +434,34 @@ class MqttService {
 
   double? _confidenceFromJson(Map<String, dynamic> jsonMap) {
     final raw = jsonMap['confidence'];
-    final value = switch (raw) {
-      final num n => n.toDouble(),
-      final String s => double.tryParse(s),
-      _ => null,
-    };
-
-    if (value == null || value.isNaN || value.isInfinite) {
-      return null;
+    if (raw != null) {
+      final value = switch (raw) {
+        final num n => n.toDouble(),
+        final String s => double.tryParse(s),
+        _ => null,
+      };
+      if (value != null && !value.isNaN && !value.isInfinite) {
+        return value.clamp(0.0, 1.0).toDouble();
+      }
     }
 
-    return value.clamp(0.0, 1.0).toDouble();
+    final fatigue = jsonMap['fatigue'] ?? jsonMap['fatigue_score'];
+    if (fatigue != null) {
+      final fValue = switch (fatigue) {
+        final num n => n.toDouble(),
+        final String s => double.tryParse(s),
+        _ => null,
+      };
+      if (fValue != null && !fValue.isNaN && !fValue.isInfinite) {
+        return (fValue / 100.0).clamp(0.0, 1.0).toDouble();
+      }
+    }
+
+    return null;
   }
 
   DateTime _timestampFromJson(Map<String, dynamic> jsonMap) {
-    final raw = jsonMap['time'];
+    final raw = jsonMap['time'] ?? jsonMap['ts_ms'] ?? jsonMap['timestamp_ms'];
 
     if (raw is int) {
       return raw > 9999999999
