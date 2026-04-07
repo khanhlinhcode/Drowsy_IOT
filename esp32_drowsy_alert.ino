@@ -519,16 +519,11 @@ bool runDrivingConfirmSequence(uint32_t nowMs) {
   }
 }
 
+bool isAttentiveForDrivingArm(uint32_t nowMs);
+
 void updateDrivingArmGate(uint32_t nowMs) {
   if (gDrowsyDetectionArmed) return;
-  if (gStartupActive) {
-    gAttentiveSinceMs = 0;
-    return;
-  }
-
-  bool dataFresh = (nowMs - gLastRxMs) <= gCurrentTtlMs;
-  bool attentive = dataFresh && gMotionDetector.isDriving() && gRawAiState == AiState::SAFE;
-  if (!attentive) {
+  if (!isAttentiveForDrivingArm(nowMs)) {
     gAttentiveSinceMs = 0;
     return;
   }
@@ -546,6 +541,13 @@ void updateDrivingArmGate(uint32_t nowMs) {
   gDrivingConfirmStepUntilMs = nowMs;
   gAttentiveSinceMs = nowMs;
   Serial.println("[DRIVE] attentive 30s confirmed -> drowsy detection armed");
+}
+
+bool isAttentiveForDrivingArm(uint32_t nowMs) {
+  if (gStartupActive) return false;
+  return ((nowMs - gLastRxMs) <= gCurrentTtlMs) &&
+         gMotionDetector.isDriving() &&
+         gRawAiState == AiState::SAFE;
 }
 
 AlertMode resolveAlertMode(uint32_t nowMs) {
@@ -1285,7 +1287,7 @@ void loop() {
   // FIX #10: only update observation when driving state actually changes.
   // Previously this ran every ~1ms, continuously resetting gCandidateSinceMs
   // and preventing any pending state transition from persisting.
-  if ((nowMs - gLastRxMs) <= gCurrentTtlMs && gRawAiState == AiState::SAFE) {
+  if (isAttentiveForDrivingArm(nowMs)) {
     SystemState idleState = (gMotionDetector.isDriving() && gDrowsyDetectionArmed) ? SystemState::DRIVING : SystemState::SAFE;
     if (idleState != gObservedState) {
       applyObservation(idleState, nowMs);
