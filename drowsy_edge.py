@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import re
 import select
 import socket
 import subprocess
@@ -83,6 +84,9 @@ MQTT_RETRY_MAX_MS = 8000
 ESP32_WIFI_SERIAL_PORT = os.getenv("ESP32_WIFI_SERIAL_PORT", "/dev/ttyUSB0")
 ESP32_WIFI_SERIAL_BAUD = int(os.getenv("ESP32_WIFI_SERIAL_BAUD", "115200"))
 PI_WIFI_INTERFACE = os.getenv("PI_WIFI_INTERFACE", "wlan0")
+DEFAULT_CMD_TIMEOUT_S = 25
+WIFI_SYNC_DUP_WINDOW_MS = 15000
+WIFI_SYNC_RETRY_DELAY_S = 2.0
 
 mqtt_client = None
 _mqtt_connected = False
@@ -144,8 +148,18 @@ def _init_mqtt():
         print("MQTT connection failed:", exc)
 
 
-def _run_cmd(cmd, timeout=25):
+def _run_cmd(cmd, timeout=DEFAULT_CMD_TIMEOUT_S):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def _is_valid_iface_name(name):
+    return bool(name) and re.fullmatch(r"[A-Za-z0-9._:-]{1,32}", name) is not None
+
+
+def _sanitize_wifi_text(value, max_len):
+    text = "" if value is None else str(value)
+    text = text.replace("\x00", "").replace("\r", "").replace("\n", "").strip()
+    return text[:max_len]
 
 
 def _get_pi_ip(interface):
@@ -172,12 +186,18 @@ def _connect_pi_wifi(ssid, password, interface):
     global _wifi_sync_last_signature, _wifi_sync_last_attempt_ms
     now_ms = int(time.monotonic() * 1000)
     signature = f"{ssid}\n{password}\n{interface}"
-    if signature == _wifi_sync_last_signature and (now_ms - _wifi_sync_last_attempt_ms) < 15000:
+    if signature == _wifi_sync_last_signature and (now_ms - _wifi_sync_last_attempt_ms) < WIFI_SYNC_DUP_WINDOW_MS:
         return
 
     _wifi_sync_last_signature = signature
     _wifi_sync_last_attempt_ms = now_ms
-    ssid = (ssid or "").strip()
+    interface = _sanitize_wifi_text(interface, 32)
+    if not _is_valid_iface_name(interface):
+        print(f"[WIFI_SYNC] invalid interface: '{interface}'")
+        return
+
+    ssid = _sanitize_wifi_text(ssid, 32)
+    password = _sanitize_wifi_text(password, 64)
     if not ssid:
         return
 
@@ -274,7 +294,7 @@ def _esp32_wifi_sync_worker():
                     line, buf = buf.split("\n", 1)
                     _handle_esp32_wifi_sync_line(line.strip())
         except Exception:
-            _stop_event.wait(2.0)
+            _stop_event.wait(WIFI_SYNC_RETRY_DELAY_S)
         finally:
             if fd >= 0:
                 try:
