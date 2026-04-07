@@ -164,6 +164,9 @@ check("INO: AlertMode has OFF, DRIVING_DOUBLE_BEEP, TIRED_SLOW_BEEP, SLEEPY_FAST
                               "SLEEPY_FAST_BEEP", "SLEEP_CONTINUOUS"]))
 
 # deriveObservedState logic
+check("INO: Detection gate requires attentive confirmation before enabling drowsy logic",
+      "if (!detectionArmed) return SystemState::SAFE" in ino)
+
 check("INO: SLEEP overrides isDriving (returns SLEEP regardless)",
       "if (aiState == AiState::SLEEP) return SystemState::SLEEP" in ino)
 
@@ -209,6 +212,10 @@ check("INO: applyDataWatchdog has 30s hard timeout for dangerous states",
 check("INO: isDangerous threshold is SLEEPY (level 3+)",
       "stateLevel(SystemState::SLEEPY)" in ino)
 
+check("INO: Driving arm gate uses 30s attentive window",
+      "DRIVING_CONFIRM_LOOK_STRAIGHT_MS = 30000" in ino and
+      "updateDrivingArmGate(nowMs)" in ino)
+
 print()
 
 # ============================================================
@@ -218,26 +225,39 @@ print("─" * 40)
 print("3) BUZZER PATTERNS")
 print("─" * 40)
 
-# Startup: 3 beeps at 2300 Hz
-startup_beeps = ino.count("setAlarm(true, 2300)")
-check(f"INO: Startup has exactly 3 beeps at 2300 Hz (found {startup_beeps})",
-      startup_beeps == 3,
-      "Must be exactly 3 for startup 'beep beep beep'")
+# Startup: 2 beeps at 2300 Hz
+startup_section = ino.split("bool runStartupSequence(uint32_t nowMs) {", 1)[1].split("bool runDrivingConfirmSequence(uint32_t nowMs) {", 1)[0]
+startup_beeps = startup_section.count("setAlarm(true, 2300)")
+check(f"INO: Startup has exactly 2 beeps at 2300 Hz (found {startup_beeps})",
+      startup_beeps == 2,
+      "Must be exactly 2 for startup 'bip bip'")
 
-# Startup timing: 120ms ON, 100ms OFF
+# Startup timing: 120ms ON, 100ms OFF, tail 660ms
 check("INO: Startup beep ON duration = 120ms",
-      ino.count("gStartupStepUntilMs = nowMs + 120") == 3)
+      startup_section.count("gStartupStepUntilMs = nowMs + 120") == 2)
 
 check("INO: Startup beep OFF gap = 100ms",
-      ino.count("gStartupStepUntilMs = nowMs + 100") == 2)
+      startup_section.count("gStartupStepUntilMs = nowMs + 100") == 1)
 
-check("INO: Startup tail silence = 440ms",
-      "gStartupStepUntilMs = nowMs + 440" in ino)
+check("INO: Startup tail silence = 660ms",
+      "gStartupStepUntilMs = nowMs + 660" in startup_section)
 
-# Startup total ≈ 120+100+120+100+120+440 = 1000ms
-startup_total = 120 + 100 + 120 + 100 + 120 + 440
+# Startup total ≈ 120+100+120+660 = 1000ms
+startup_total = 120 + 100 + 120 + 660
 check(f"INO: Startup total duration ≈ {startup_total}ms (target ~1000ms)",
       abs(startup_total - 1000) <= 10)
+
+# Driving start confirm: 3 beeps at 2300 Hz after 30s attentive
+confirm_section = ino.split("bool runDrivingConfirmSequence(uint32_t nowMs) {", 1)[1].split("void updateDrivingArmGate(uint32_t nowMs) {", 1)[0]
+confirm_beeps = confirm_section.count("setAlarm(true, 2300)")
+check(f"INO: Driving confirm has exactly 3 beeps at 2300 Hz (found {confirm_beeps})",
+      confirm_beeps == 3)
+
+check("INO: Driving confirm uses 120ms ON",
+      confirm_section.count("gDrivingConfirmStepUntilMs = nowMs + 120") == 3)
+
+check("INO: Driving confirm uses 100ms gaps",
+      confirm_section.count("gDrivingConfirmStepUntilMs = nowMs + 100") == 2)
 
 # Driving alive: double beep at 1600 Hz, 1.2s cycle
 check("INO: Driving pattern uses 1600 Hz",
