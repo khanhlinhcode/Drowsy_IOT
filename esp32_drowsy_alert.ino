@@ -71,6 +71,7 @@ const uint32_t CONFIRMED_STATE_HOLD_MS = 180;
 const uint32_t SLEEP_CONTINUOUS_MIN_MS = 5000;  // Continuous alarm >= 5s
 // FIX #6: hard timeout to force-reset dangerous state when MQTT is dead.
 const uint32_t WATCHDOG_HARD_TIMEOUT_MS = 30000;
+const uint32_t DRIVING_CONFIRM_LOOK_STRAIGHT_MS = 30000;  // Need 30s attentive before enabling drowsy detection.
 const uint32_t ESP_TELEMETRY_MS = 1000;
 const char* MQTT_TOPIC_ESP_TELEMETRY = "driver/esp32_telemetry";
 
@@ -168,6 +169,11 @@ bool gButtonResetFired = false;  // prevent repeated triggers while held
 bool gStartupActive = true;
 uint8_t gStartupStep = 0;
 uint32_t gStartupStepUntilMs = 0;
+bool gDrivingConfirmBeepActive = false;
+uint8_t gDrivingConfirmStep = 0;
+uint32_t gDrivingConfirmStepUntilMs = 0;
+bool gDrowsyDetectionArmed = false;
+uint32_t gAttentiveSinceMs = 0;
 
 // Alert scheduler
 AlertMode gAlertMode = AlertMode::OFF;
@@ -314,7 +320,8 @@ AiState mapStatusTextToAiState(const char* statusText, bool* ok) {
   return AiState::SAFE;
 }
 
-SystemState deriveObservedState(AiState aiState, bool driving) {
+SystemState deriveObservedState(AiState aiState, bool driving, bool detectionArmed) {
+  if (!detectionArmed) return SystemState::SAFE;
   if (aiState == AiState::SLEEP) return SystemState::SLEEP;
 
   if (!driving) return SystemState::SAFE;   // không chạy xe => im
@@ -457,20 +464,10 @@ bool runStartupSequence(uint32_t nowMs) {
       gStartupStep = 3;
       return true;
     case 3:
-      setAlarm(false, 0);
-      gStartupStepUntilMs = nowMs + 100;
-      gStartupStep = 4;
-      return true;
-    case 4:
-      setAlarm(true, 2300);
-      gStartupStepUntilMs = nowMs + 120;
-      gStartupStep = 5;
-      return true;
-    case 5:
       // CRITICAL: hold final silence so startup sequence is ~1 second total.
       setAlarm(false, 0);
-      gStartupStepUntilMs = nowMs + 440;
-      gStartupStep = 6;
+      gStartupStepUntilMs = nowMs + 660;
+      gStartupStep = 4;
       return true;
     default:
       setAlarm(false, 0);
@@ -478,6 +475,79 @@ bool runStartupSequence(uint32_t nowMs) {
       gStartupActive = false;
       return false;
   }
+}
+
+bool runDrivingConfirmSequence(uint32_t nowMs) {
+  if (!gDrivingConfirmBeepActive) return false;
+  if (isDangerous(gStableState)) {
+    gDrivingConfirmBeepActive = false;
+    setAlarm(false, 0);
+    return false;
+  }
+  if (nowMs < gDrivingConfirmStepUntilMs) return true;
+
+  switch (gDrivingConfirmStep) {
+    case 0:
+      setAlarm(true, 2300);
+      gDrivingConfirmStepUntilMs = nowMs + 120;
+      gDrivingConfirmStep = 1;
+      return true;
+    case 1:
+      setAlarm(false, 0);
+      gDrivingConfirmStepUntilMs = nowMs + 100;
+      gDrivingConfirmStep = 2;
+      return true;
+    case 2:
+      setAlarm(true, 2300);
+      gDrivingConfirmStepUntilMs = nowMs + 120;
+      gDrivingConfirmStep = 3;
+      return true;
+    case 3:
+      setAlarm(false, 0);
+      gDrivingConfirmStepUntilMs = nowMs + 100;
+      gDrivingConfirmStep = 4;
+      return true;
+    case 4:
+      setAlarm(true, 2300);
+      gDrivingConfirmStepUntilMs = nowMs + 120;
+      gDrivingConfirmStep = 5;
+      return true;
+    default:
+      setAlarm(false, 0);
+      gDrivingConfirmBeepActive = false;
+      return false;
+  }
+}
+
+bool isAttentiveForDrivingArm(uint32_t nowMs);
+
+void updateDrivingArmGate(uint32_t nowMs) {
+  if (gDrowsyDetectionArmed) return;
+  if (!isAttentiveForDrivingArm(nowMs)) {
+    gAttentiveSinceMs = 0;
+    return;
+  }
+
+  if (gAttentiveSinceMs == 0) {
+    gAttentiveSinceMs = nowMs;
+    return;
+  }
+
+  if ((nowMs - gAttentiveSinceMs) < DRIVING_CONFIRM_LOOK_STRAIGHT_MS) return;
+
+  gDrowsyDetectionArmed = true;
+  gDrivingConfirmBeepActive = true;
+  gDrivingConfirmStep = 0;
+  gDrivingConfirmStepUntilMs = nowMs;
+  gAttentiveSinceMs = nowMs;
+  Serial.println("[DRIVE] attentive 30s confirmed -> drowsy detection armed");
+}
+
+bool isAttentiveForDrivingArm(uint32_t nowMs) {
+  if (gStartupActive) return false;
+  return ((nowMs - gLastRxMs) <= gCurrentTtlMs) &&
+         gMotionDetector.isDriving() &&
+         gRawAiState == AiState::SAFE;
 }
 
 AlertMode resolveAlertMode(uint32_t nowMs) {
@@ -525,6 +595,7 @@ void applyLedsForState() {
 
 void updateAlertEngine(uint32_t nowMs) {
   if (runStartupSequence(nowMs)) return;
+  if (runDrivingConfirmSequence(nowMs)) return;
 
   if (gStableState != gLastAlertState &&
       (nowMs - gLastStateChangeMs) > ALERT_STATE_DEBOUNCE_MS &&
@@ -843,7 +914,7 @@ void applyDataWatchdog(uint32_t nowMs) {
   if (isDangerous(gStableState) && age < WATCHDOG_HARD_TIMEOUT_MS) return;
 
   bool driving = gMotionDetector.isDriving();
-  setStableState(driving ? SystemState::DRIVING : SystemState::SAFE, nowMs);
+  setStableState((driving && gDrowsyDetectionArmed) ? SystemState::DRIVING : SystemState::SAFE, nowMs);
 }
 
 // ============================================================
@@ -1016,7 +1087,7 @@ void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
 
   acceptPacket(pkt, nowMs);
   bool driving = gMotionDetector.isDriving();
-  SystemState observed = deriveObservedState(pkt.aiState, driving);
+  SystemState observed = deriveObservedState(pkt.aiState, driving, gDrowsyDetectionArmed);
   applyObservation(observed, nowMs);
 }
 
@@ -1211,12 +1282,13 @@ void loop() {
   gMotionDetector.tick(nowMs);
   checkWifiResetButton(nowMs);  // Method A: long-press button check
   processConnectivity(nowMs);
+  updateDrivingArmGate(nowMs);
 
   // FIX #10: only update observation when driving state actually changes.
   // Previously this ran every ~1ms, continuously resetting gCandidateSinceMs
   // and preventing any pending state transition from persisting.
-  if ((nowMs - gLastRxMs) <= gCurrentTtlMs && gRawAiState == AiState::SAFE) {
-    SystemState idleState = gMotionDetector.isDriving() ? SystemState::DRIVING : SystemState::SAFE;
+  if (isAttentiveForDrivingArm(nowMs)) {
+    SystemState idleState = (gMotionDetector.isDriving() && gDrowsyDetectionArmed) ? SystemState::DRIVING : SystemState::SAFE;
     if (idleState != gObservedState) {
       applyObservation(idleState, nowMs);
     }
