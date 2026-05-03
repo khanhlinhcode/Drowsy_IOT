@@ -8,7 +8,9 @@ import '../services/auth_service.dart';
 import '../widgets/glass_card.dart';
 
 class AnalyticsScreen extends StatelessWidget {
-  const AnalyticsScreen({super.key});
+  const AnalyticsScreen({super.key, this.showBackButton = true});
+
+  final bool showBackButton;
 
   @override
   Widget build(BuildContext context) {
@@ -40,30 +42,34 @@ class AnalyticsScreen extends StatelessWidget {
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
             colors: <Color>[
-              Color(0xFF0A1425),
-              Color(0xFF121E34),
-              Color(0xFF091321),
+              Color(0xFF070E1A),
+              Color(0xFF0E1728),
+              Color(0xFF070E1A),
             ],
           ),
         ),
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
             child: Column(
               children: <Widget>[
+                // ── Header ──────────────────────────────────────────
                 Row(
                   children: <Widget>[
-                    _RoundIconButton(
-                      icon: CupertinoIcons.back,
-                      onTap: () => Navigator.of(context).pop(),
-                    ),
-                    const SizedBox(width: 12),
+                    if (showBackButton)
+                      _RoundIconButton(
+                        icon: CupertinoIcons.back,
+                        onTap: () => Navigator.of(context).pop(),
+                      ),
+                    if (showBackButton) const SizedBox(width: 12),
                     Expanded(
                       child: Text(
                         'Analytics',
                         style: Theme.of(context).textTheme.titleLarge?.copyWith(
                           color: Colors.white,
                           fontWeight: FontWeight.w700,
+                          fontSize: 20,
+                          letterSpacing: -0.3,
                         ),
                       ),
                     ),
@@ -75,193 +81,185 @@ class AnalyticsScreen extends StatelessWidget {
                     ),
                   ],
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 16),
+
+                // ── Content ─────────────────────────────────────────
                 Expanded(
                   child: ListView(
                     physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.only(bottom: 100),
                     children: <Widget>[
+                      // ── Realtime Summary ──────────────────────────
+                      _SectionHeader(
+                        title: 'Realtime Summary',
+                        icon: CupertinoIcons.graph_circle,
+                      ),
+                      const SizedBox(height: 8),
                       GlassCard(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-                        gradientColors: <Color>[
-                          Colors.white.withValues(alpha: 0.20),
-                          Colors.white.withValues(alpha: 0.08),
-                        ],
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        padding: const EdgeInsets.all(16),
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
                           children: <Widget>[
-                            Text(
-                              'Realtime Summary',
-                              style: Theme.of(context).textTheme.titleMedium
-                                  ?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                  ),
+                            _MetricTile(
+                              label: 'User',
+                              value: provider.userId,
+                              icon: CupertinoIcons.person,
                             ),
-                            const SizedBox(height: 12),
-                            Wrap(
-                              spacing: 10,
-                              runSpacing: 10,
-                              children: <Widget>[
-                                _MetricChip(
-                                  label: 'User',
-                                  value: provider.userId,
-                                ),
-                                _MetricChip(
-                                  label: 'Topic',
-                                  value: provider.subscribedTopic,
-                                ),
-                                _MetricChip(
-                                  label: 'Sleep Events',
-                                  value: provider.totalSleepCount.toString(),
-                                ),
-                                _MetricChip(
-                                  label: 'Fatigue',
-                                  value:
-                                      '${provider.fatiguePercentage.toStringAsFixed(1)}%',
-                                ),
-                                _MetricChip(
-                                  label: 'Avg Confidence',
-                                  value:
-                                      '${(provider.averageConfidence * 100).toStringAsFixed(1)}%',
-                                ),
-                                _MetricChip(
-                                  label: 'Latency',
-                                  value: '${provider.latestLatencyMs} ms',
-                                ),
-                                _MetricChip(
-                                  label: 'Network',
-                                  value: provider.connectionQuality
-                                      .toUpperCase(),
-                                ),
-                                _MetricChip(
-                                  label: 'Samples',
-                                  value: provider.totalEvents.toString(),
-                                ),
-                              ],
+                            _MetricTile(
+                              label: 'Topic',
+                              value: provider.subscribedTopic,
+                              icon: CupertinoIcons.antenna_radiowaves_left_right,
+                            ),
+                            _MetricTile(
+                              label: 'Sleep Events',
+                              value: provider.totalSleepCount.toString(),
+                              icon: CupertinoIcons.exclamationmark_triangle,
+                            ),
+                            _MetricTile(
+                              label: 'Fatigue',
+                              value:
+                                  '${provider.fatiguePercentage.toStringAsFixed(1)}%',
+                              icon: CupertinoIcons.battery_25,
+                            ),
+                            _MetricTile(
+                              label: 'Confidence',
+                              value:
+                                  '${(provider.averageConfidence * 100).toStringAsFixed(1)}%',
+                              icon: CupertinoIcons.chart_bar,
+                            ),
+                            _MetricTile(
+                              label: 'Latency',
+                              value: '${provider.latestLatencyMs} ms',
+                              icon: CupertinoIcons.timer,
+                            ),
+                            _MetricTile(
+                              label: 'Drive Time',
+                              value: provider.driveDurationLabel,
+                              icon: CupertinoIcons.car,
+                            ),
+                            _MetricTile(
+                              label: 'Sleep Gap',
+                              value: provider.lastSleepGapLabel,
+                              icon: CupertinoIcons.clock,
+                            ),
+                            _MetricTile(
+                              label: 'Network',
+                              value: provider.connectionQuality.toUpperCase(),
+                              icon: CupertinoIcons.wifi,
+                            ),
+                            _MetricTile(
+                              label: 'Samples',
+                              value: provider.totalEvents.toString(),
+                              icon: CupertinoIcons.doc_text,
                             ),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 20),
+
+                      // ── Today Stats ───────────────────────────────
+                      _SectionHeader(
+                        title: 'Today',
+                        icon: CupertinoIcons.calendar_today,
+                      ),
+                      const SizedBox(height: 8),
                       GlassCard(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-                        gradientColors: <Color>[
-                          Colors.white.withValues(alpha: 0.20),
-                          Colors.white.withValues(alpha: 0.08),
-                        ],
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
+                        child: Row(
                           children: <Widget>[
-                            Text(
-                              'Daily Stats (Today)',
-                              style: Theme.of(context).textTheme.titleMedium
-                                  ?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                  ),
+                            Expanded(
+                              child: _DailyCell(
+                                label: 'Total',
+                                value: todayStats.total.toString(),
+                                color: const Color(0xFF60A5FA),
+                              ),
                             ),
-                            const SizedBox(height: 12),
-                            Row(
-                              children: <Widget>[
-                                Expanded(
-                                  child: _DailyCell(
-                                    label: 'Total',
-                                    value: todayStats.total.toString(),
-                                  ),
-                                ),
-                                Expanded(
-                                  child: _DailyCell(
-                                    label: 'Normal',
-                                    value: todayStats.normal.toString(),
-                                  ),
-                                ),
-                                Expanded(
-                                  child: _DailyCell(
-                                    label: 'Sleepy',
-                                    value: todayStats.sleepy.toString(),
-                                  ),
-                                ),
-                                Expanded(
-                                  child: _DailyCell(
-                                    label: 'Sleep',
-                                    value: todayStats.sleep.toString(),
-                                  ),
-                                ),
-                              ],
+                            _VerticalDivider(),
+                            Expanded(
+                              child: _DailyCell(
+                                label: 'Normal',
+                                value: todayStats.normal.toString(),
+                                color: const Color(0xFF34D399),
+                              ),
+                            ),
+                            _VerticalDivider(),
+                            Expanded(
+                              child: _DailyCell(
+                                label: 'Sleepy',
+                                value: todayStats.sleepy.toString(),
+                                color: const Color(0xFFFBBF24),
+                              ),
+                            ),
+                            _VerticalDivider(),
+                            Expanded(
+                              child: _DailyCell(
+                                label: 'Sleep',
+                                value: todayStats.sleep.toString(),
+                                color: const Color(0xFFF87171),
+                              ),
                             ),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 20),
+
+                      // ── Weekly Trend ──────────────────────────────
+                      _SectionHeader(
+                        title: 'Weekly Trend',
+                        icon: CupertinoIcons.chart_bar_alt_fill,
+                      ),
+                      const SizedBox(height: 8),
                       GlassCard(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-                        gradientColors: <Color>[
-                          Colors.white.withValues(alpha: 0.20),
-                          Colors.white.withValues(alpha: 0.08),
-                        ],
+                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
                         child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            Text(
-                              'Weekly Trend',
-                              style: Theme.of(context).textTheme.titleMedium
-                                  ?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                            ),
-                            const SizedBox(height: 10),
                             ...weeklyStats.map((day) {
                               final ratio = day.total == 0
                                   ? 0.0
                                   : (day.sleep + day.sleepy * 0.5) / day.total;
+                              final isToday = day == weeklyStats.last;
                               return Padding(
                                 padding: const EdgeInsets.only(bottom: 10),
                                 child: _TrendRow(
                                   dayLabel: day.label,
                                   total: day.total,
                                   ratio: ratio,
+                                  isToday: isToday,
                                 ),
                               );
                             }),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 20),
+
+                      // ── State Distribution ────────────────────────
+                      _SectionHeader(
+                        title: 'Distribution',
+                        icon: CupertinoIcons.chart_pie,
+                      ),
+                      const SizedBox(height: 8),
                       GlassCard(
                         padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-                        gradientColors: <Color>[
-                          Colors.white.withValues(alpha: 0.20),
-                          Colors.white.withValues(alpha: 0.08),
-                        ],
                         child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            Text(
-                              'State Distribution',
-                              style: Theme.of(context).textTheme.titleMedium
-                                  ?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                            ),
-                            const SizedBox(height: 10),
                             _DistRow(
                               label: 'Normal',
                               pct: normalPct,
-                              color: const Color(0xFF37D67A),
+                              color: const Color(0xFF34D399),
                             ),
-                            const SizedBox(height: 8),
+                            const SizedBox(height: 12),
                             _DistRow(
                               label: 'Sleepy',
                               pct: sleepyPct,
-                              color: const Color(0xFFFFA62B),
+                              color: const Color(0xFFFBBF24),
                             ),
-                            const SizedBox(height: 8),
+                            const SizedBox(height: 12),
                             _DistRow(
                               label: 'Sleep',
                               pct: sleepPct,
-                              color: const Color(0xFFFF4D5D),
+                              color: const Color(0xFFF87171),
                             ),
                           ],
                         ),
@@ -318,6 +316,45 @@ class AnalyticsScreen extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Section Header
+// ─────────────────────────────────────────────────────────────────────────────
+class _SectionHeader extends StatelessWidget {
+  const _SectionHeader({required this.title, required this.icon});
+
+  final String title;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Row(
+        children: <Widget>[
+          Icon(
+            icon,
+            size: 15,
+            color: Colors.white.withValues(alpha: 0.35),
+          ),
+          const SizedBox(width: 7),
+          Text(
+            title,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Colors.white.withValues(alpha: 0.45),
+              fontWeight: FontWeight.w700,
+              fontSize: 12,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round Icon Button
+// ─────────────────────────────────────────────────────────────────────────────
 class _RoundIconButton extends StatelessWidget {
   const _RoundIconButton({required this.icon, required this.onTap});
 
@@ -329,51 +366,88 @@ class _RoundIconButton extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 40,
-        height: 40,
+        width: 38,
+        height: 38,
         decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.15),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.32)),
+          color: Colors.white.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(11),
+          border: Border.all(
+            color: Colors.white.withValues(alpha: 0.10),
+            width: 0.5,
+          ),
         ),
-        child: Icon(icon, color: Colors.white),
+        child: Icon(
+          icon,
+          color: Colors.white.withValues(alpha: 0.70),
+          size: 18,
+        ),
       ),
     );
   }
 }
 
-class _MetricChip extends StatelessWidget {
-  const _MetricChip({required this.label, required this.value});
+// ─────────────────────────────────────────────────────────────────────────────
+// Metric Tile — compact data display with icon
+// ─────────────────────────────────────────────────────────────────────────────
+class _MetricTile extends StatelessWidget {
+  const _MetricTile({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
 
   final String label;
   final String value;
+  final IconData icon;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.14),
+        color: Colors.white.withValues(alpha: 0.06),
         borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.06),
+          width: 0.5,
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          Text(
-            label,
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Colors.white70,
-              fontWeight: FontWeight.w600,
-            ),
+          Icon(
+            icon,
+            size: 14,
+            color: Colors.white.withValues(alpha: 0.30),
           ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-            ),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(
+                label,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Colors.white.withValues(alpha: 0.40),
+                  fontWeight: FontWeight.w600,
+                  fontSize: 10,
+                ),
+              ),
+              const SizedBox(height: 2),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 100),
+                child: Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.white.withValues(alpha: 0.85),
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -381,29 +455,40 @@ class _MetricChip extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Daily Cell — today stats
+// ─────────────────────────────────────────────────────────────────────────────
 class _DailyCell extends StatelessWidget {
-  const _DailyCell({required this.label, required this.value});
+  const _DailyCell({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
 
   final String label;
   final String value;
+  final Color color;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: <Widget>[
         Text(
-          label,
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: Colors.white70,
-            fontWeight: FontWeight.w600,
+          value,
+          style: Theme.of(context).textTheme.titleLarge?.copyWith(
+            color: Colors.white,
+            fontWeight: FontWeight.w800,
+            fontSize: 22,
           ),
         ),
         const SizedBox(height: 4),
         Text(
-          value,
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-            color: Colors.white,
-            fontWeight: FontWeight.w700,
+          label,
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: color.withValues(alpha: 0.65),
+            fontWeight: FontWeight.w600,
+            fontSize: 11,
           ),
         ),
       ],
@@ -411,28 +496,47 @@ class _DailyCell extends StatelessWidget {
   }
 }
 
+class _VerticalDivider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 0.5,
+      height: 32,
+      color: Colors.white.withValues(alpha: 0.10),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trend Row — weekly bar chart row
+// ─────────────────────────────────────────────────────────────────────────────
 class _TrendRow extends StatelessWidget {
   const _TrendRow({
     required this.dayLabel,
     required this.total,
     required this.ratio,
+    this.isToday = false,
   });
 
   final String dayLabel;
   final int total;
   final double ratio;
+  final bool isToday;
 
   @override
   Widget build(BuildContext context) {
     return Row(
       children: <Widget>[
         SizedBox(
-          width: 34,
+          width: 32,
           child: Text(
             dayLabel,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Colors.white70,
-              fontWeight: FontWeight.w600,
+              color: isToday
+                  ? const Color(0xFF60A5FA)
+                  : Colors.white.withValues(alpha: 0.45),
+              fontWeight: isToday ? FontWeight.w700 : FontWeight.w600,
+              fontSize: 11,
             ),
           ),
         ),
@@ -440,25 +544,38 @@ class _TrendRow extends StatelessWidget {
         Expanded(
           child: ClipRRect(
             borderRadius: BorderRadius.circular(999),
-            child: LinearProgressIndicator(
-              value: ratio.clamp(0.0, 1.0),
-              minHeight: 8,
-              backgroundColor: Colors.white.withValues(alpha: 0.12),
-              valueColor: const AlwaysStoppedAnimation<Color>(
-                Color(0xFF7DD3FC),
-              ),
+            child: TweenAnimationBuilder<double>(
+              tween: Tween<double>(begin: 0, end: ratio.clamp(0.0, 1.0)),
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) {
+                return LinearProgressIndicator(
+                  value: value,
+                  minHeight: 6,
+                  backgroundColor: Colors.white.withValues(alpha: 0.06),
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    isToday
+                        ? const Color(0xFF60A5FA)
+                        : const Color(0xFF60A5FA).withValues(alpha: 0.50),
+                  ),
+                );
+              },
             ),
           ),
         ),
         const SizedBox(width: 10),
         SizedBox(
-          width: 42,
+          width: 36,
           child: Text(
             total.toString(),
             textAlign: TextAlign.right,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Colors.white,
+              color: Colors.white.withValues(alpha: 0.65),
               fontWeight: FontWeight.w700,
+              fontSize: 12,
+              fontFeatures: <FontFeature>[
+                const FontFeature.tabularFigures(),
+              ],
             ),
           ),
         ),
@@ -467,6 +584,9 @@ class _TrendRow extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Distribution Row
+// ─────────────────────────────────────────────────────────────────────────────
 class _DistRow extends StatelessWidget {
   const _DistRow({required this.label, required this.pct, required this.color});
 
@@ -480,36 +600,58 @@ class _DistRow extends StatelessWidget {
 
     return Row(
       children: <Widget>[
+        Container(
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: color,
+          ),
+        ),
+        const SizedBox(width: 10),
         SizedBox(
-          width: 56,
+          width: 60,
           child: Text(
             label,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Colors.white70,
+              color: Colors.white.withValues(alpha: 0.60),
               fontWeight: FontWeight.w600,
+              fontSize: 12,
             ),
           ),
         ),
+        const SizedBox(width: 8),
         Expanded(
           child: ClipRRect(
             borderRadius: BorderRadius.circular(999),
-            child: LinearProgressIndicator(
-              value: pct.clamp(0.0, 1.0),
-              minHeight: 8,
-              backgroundColor: Colors.white.withValues(alpha: 0.12),
-              valueColor: AlwaysStoppedAnimation<Color>(color),
+            child: TweenAnimationBuilder<double>(
+              tween: Tween<double>(begin: 0, end: pct.clamp(0.0, 1.0)),
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) {
+                return LinearProgressIndicator(
+                  value: value,
+                  minHeight: 6,
+                  backgroundColor: Colors.white.withValues(alpha: 0.06),
+                  valueColor: AlwaysStoppedAnimation<Color>(color),
+                );
+              },
             ),
           ),
         ),
         const SizedBox(width: 10),
         SizedBox(
-          width: 48,
+          width: 44,
           child: Text(
             '${percent.toStringAsFixed(1)}%',
             textAlign: TextAlign.right,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Colors.white,
+              color: Colors.white.withValues(alpha: 0.70),
               fontWeight: FontWeight.w700,
+              fontSize: 12,
+              fontFeatures: <FontFeature>[
+                const FontFeature.tabularFigures(),
+              ],
             ),
           ),
         ),

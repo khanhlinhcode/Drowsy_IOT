@@ -7,11 +7,12 @@ class GlassCard extends StatelessWidget {
     super.key,
     required this.child,
     this.padding = const EdgeInsets.all(24),
-    this.borderRadius = 28,
-    this.blurSigma = 18,
+    this.borderRadius = 24,
+    this.blurSigma = 24,
     this.width,
     this.height,
     this.gradientColors,
+    this.margin,
   });
 
   final Widget child;
@@ -21,51 +22,49 @@ class GlassCard extends StatelessWidget {
   final double? width;
   final double? height;
   final List<Color>? gradientColors;
+  final EdgeInsetsGeometry? margin;
 
   @override
   Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(borderRadius),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 420),
-          curve: Curves.easeOutCubic,
-          width: width,
-          height: height,
-          padding: padding,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(borderRadius),
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors:
-                  gradientColors ??
-                  <Color>[
-                    Colors.white.withValues(alpha: 0.24),
-                    Colors.white.withValues(alpha: 0.12),
-                  ],
-            ),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.28),
-              width: 1.2,
-            ),
-            boxShadow: <BoxShadow>[
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.14),
-                blurRadius: 28,
-                spreadRadius: 2,
-                offset: const Offset(0, 14),
+    return Padding(
+      padding: margin ?? EdgeInsets.zero,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(borderRadius),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 420),
+            curve: Curves.easeOutCubic,
+            width: width,
+            height: height,
+            padding: padding,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(borderRadius),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors:
+                    gradientColors ??
+                    <Color>[
+                      Colors.white.withValues(alpha: 0.18),
+                      Colors.white.withValues(alpha: 0.06),
+                    ],
               ),
-              BoxShadow(
-                color: Colors.white.withValues(alpha: 0.08),
-                blurRadius: 12,
-                spreadRadius: -4,
-                offset: const Offset(0, -2),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.18),
+                width: 0.8,
               ),
-            ],
+              boxShadow: <BoxShadow>[
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.18),
+                  blurRadius: 32,
+                  spreadRadius: 0,
+                  offset: const Offset(0, 12),
+                ),
+              ],
+            ),
+            child: child,
           ),
-          child: child,
         ),
       ),
     );

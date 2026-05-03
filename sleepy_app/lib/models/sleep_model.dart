@@ -4,18 +4,45 @@ class SleepModel {
     required this.state,
     required this.confidence,
     required this.time,
+    this.runtimeMs,
+    this.rawStatus,
+    this.signal,
+    this.fatigue,
+    this.armed,
+    this.faceLock,
+    this.faceInFrame,
+    this.eventId,
+    this.topic,
   });
 
   final int? id;
   final SleepState state;
   final double confidence;
   final DateTime time;
+  final int? runtimeMs;
+  final String? rawStatus;
+  final int? signal;
+  final int? fatigue;
+  final bool? armed;
+  final bool? faceLock;
+  final bool? faceInFrame;
+  final String? eventId;
+  final String? topic;
 
   factory SleepModel.fromJson(Map<String, dynamic> json) {
     return SleepModel(
       state: SleepStateX.fromRaw(json['state'] as String?),
       confidence: _parseConfidence(json['confidence']),
       time: _parseTimestamp(json['time']),
+      runtimeMs: _parseInt(json['runtime_ms']),
+      rawStatus: _parseRawStatus(json['raw_status'] ?? json['status']),
+      signal: _parseInt(json['signal']),
+      fatigue: _parseInt(json['fatigue']),
+      armed: _parseBool(json['armed']),
+      faceLock: _parseBool(json['face_lock']),
+      faceInFrame: _parseBool(json['face_in_frame']),
+      eventId: _parseString(json['event_id']),
+      topic: _parseString(json['topic']),
     );
   }
 
@@ -25,6 +52,15 @@ class SleepModel {
       state: SleepStateX.fromRaw(map['state'] as String?),
       confidence: _parseConfidence(map['confidence']),
       time: _parseTimestamp(map['timestamp']),
+      runtimeMs: _parseInt(map['runtime_ms']),
+      rawStatus: _parseRawStatus(map['raw_status'] ?? map['status']),
+      signal: _parseInt(map['signal']),
+      fatigue: _parseInt(map['fatigue']),
+      armed: _parseBool(map['armed']),
+      faceLock: _parseBool(map['face_lock']),
+      faceInFrame: _parseBool(map['face_in_frame']),
+      eventId: _parseString(map['event_id']),
+      topic: _parseString(map['topic']),
     );
   }
 
@@ -33,6 +69,15 @@ class SleepModel {
       'state': state.rawValue,
       'confidence': confidence,
       'time': time.millisecondsSinceEpoch,
+      if (runtimeMs != null) 'runtime_ms': runtimeMs,
+      if (rawStatus != null) 'raw_status': rawStatus,
+      if (signal != null) 'signal': signal,
+      if (fatigue != null) 'fatigue': fatigue,
+      if (armed != null) 'armed': armed,
+      if (faceLock != null) 'face_lock': faceLock,
+      if (faceInFrame != null) 'face_in_frame': faceInFrame,
+      if (eventId != null) 'event_id': eventId,
+      if (topic != null) 'topic': topic,
     };
   }
 
@@ -42,7 +87,37 @@ class SleepModel {
       'state': state.rawValue,
       'confidence': confidence,
       'timestamp': time.millisecondsSinceEpoch,
+      if (runtimeMs != null) 'runtime_ms': runtimeMs,
+      if (rawStatus != null) 'raw_status': rawStatus,
+      if (signal != null) 'signal': signal,
+      if (fatigue != null) 'fatigue': fatigue,
+      if (armed != null) 'armed': armed! ? 1 : 0,
+      if (faceLock != null) 'face_lock': faceLock! ? 1 : 0,
+      if (faceInFrame != null) 'face_in_frame': faceInFrame! ? 1 : 0,
+      if (eventId != null) 'event_id': eventId,
+      if (topic != null) 'topic': topic,
     };
+  }
+
+  SleepModel withMissingFrom(SleepModel? base) {
+    if (base == null) {
+      return this;
+    }
+    return SleepModel(
+      id: id,
+      state: state,
+      confidence: confidence,
+      time: time,
+      runtimeMs: runtimeMs ?? base.runtimeMs,
+      rawStatus: rawStatus ?? base.rawStatus,
+      signal: signal ?? base.signal,
+      fatigue: fatigue ?? base.fatigue,
+      armed: armed ?? base.armed,
+      faceLock: faceLock ?? base.faceLock,
+      faceInFrame: faceInFrame ?? base.faceInFrame,
+      eventId: eventId ?? base.eventId,
+      topic: topic ?? base.topic,
+    );
   }
 
   static double _parseConfidence(dynamic value) {
@@ -100,6 +175,44 @@ class SleepModel {
     }
 
     return DateTime.now();
+  }
+
+  static int? _parseInt(dynamic value) {
+    return switch (value) {
+      final int i => i,
+      final num n => n.toInt(),
+      final String s => int.tryParse(s),
+      _ => null,
+    };
+  }
+
+  static bool? _parseBool(dynamic value) {
+    return switch (value) {
+      final bool b => b,
+      final num n => n != 0,
+      final String s =>
+        s.trim().toLowerCase() == 'true'
+            ? true
+            : (s.trim() == '1'
+                  ? true
+                  : (s.trim().toLowerCase() == 'false' || s.trim() == '0'
+                        ? false
+                        : null)),
+      _ => null,
+    };
+  }
+
+  static String? _parseString(dynamic value) {
+    if (value == null) return null;
+    final text = value.toString().trim();
+    if (text.isEmpty) return null;
+    return text;
+  }
+
+  static String? _parseRawStatus(dynamic value) {
+    final text = _parseString(value);
+    if (text == null) return null;
+    return text.toUpperCase();
   }
 }
 

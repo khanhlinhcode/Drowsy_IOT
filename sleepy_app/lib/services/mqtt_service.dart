@@ -211,7 +211,7 @@ class MqttService {
 
   void _onUpdates(List<mqtt.MqttReceivedMessage<mqtt.MqttMessage>> events) {
     for (final event in events) {
-      if (_isDisposed || !event.topic.startsWith(config.topic)) {
+      if (_isDisposed || !_topicAccepted(event.topic)) {
         continue;
       }
 
@@ -220,8 +220,8 @@ class MqttService {
         final payloadText = mqtt.MqttPublishPayload.bytesToStringAsString(
           payload.payload.message,
         );
-        _debugLog('RAW MQTT: $payloadText');
-        final model = _parsePayload(payloadText);
+        _debugLog('RAW MQTT [${event.topic}]: $payloadText');
+        final model = _parsePayload(event.topic, payloadText);
         if (model != null) {
           _emitMessage(model);
         } else {
@@ -235,6 +235,25 @@ class MqttService {
       }
     }
   }
+
+  bool _topicAccepted(String topic) {
+    final configured = _normalizeTopic(config.topic.trim());
+    final incoming = _normalizeTopic(topic);
+    if (configured.isEmpty) {
+      return false;
+    }
+    if (configured == incoming) {
+      return true;
+    }
+    if (configured.endsWith('/#')) {
+      final prefix = configured.substring(0, configured.length - 1);
+      return incoming.startsWith(prefix);
+    }
+    return incoming == configured;
+  }
+
+  String _normalizeTopic(String value) =>
+      value.startsWith('/') ? value.substring(1) : value;
 
   // SleepModel? _parsePayload(String payloadText) {
   //   final payload = payloadText.trim();
@@ -272,11 +291,15 @@ class MqttService {
   //     return null;
   //   }
   // }
-  SleepModel? _parsePayload(String payloadText) {
+  SleepModel? _parsePayload(String topic, String payloadText) {
     final payload = payloadText.trim();
     if (payload.isEmpty) return null;
 
     try {
+      if (_isAlertEventTopic(topic)) {
+        return _parseAlertEvent(payload);
+      }
+
       // 1. numeric
       final numericValue = int.tryParse(payload);
       if (numericValue != null) {
@@ -294,7 +317,14 @@ class MqttService {
         return SleepModel(
           state: state,
           time: _timestampFromJson(decoded),
+          runtimeMs: _intFromAny(decoded['runtime_ms'] ?? decoded['ts_ms']),
           confidence: _confidenceFromJson(decoded) ?? 1.0,
+          rawStatus: _rawStatusFromJson(decoded),
+          signal: _intFromAny(decoded['signal']),
+          fatigue: _intFromAny(decoded['fatigue'] ?? decoded['fatigue_score']),
+          armed: _armedFromJson(decoded),
+          eventId: _stringFromAny(decoded['event_id']),
+          topic: _normalizeTopic(topic),
         );
       }
 
@@ -306,6 +336,71 @@ class MqttService {
     }
   }
 
+  bool _isAlertEventTopic(String topic) =>
+      _normalizeTopic(topic) == 'driver/alert_event' ||
+      _normalizeTopic(topic).endsWith('/alert_event');
+
+  SleepModel? _parseAlertEvent(String payloadText) {
+    if (!payloadText.startsWith('{')) {
+      return null;
+    }
+    final decoded = jsonDecode(payloadText);
+    if (decoded is! Map<String, dynamic>) {
+      return null;
+    }
+
+    final eventType = (decoded['event_type'] ?? '').toString().toUpperCase();
+    final resolvedRaw = decoded['resolved'];
+    final bool resolved = switch (resolvedRaw) {
+      final bool b => b,
+      final num n => n != 0,
+      final String s => s.toLowerCase() == 'true' || s == '1',
+      _ => eventType.contains('RESOLVED'),
+    };
+
+    if (eventType == 'DROWSY_ALERT' && !resolved) {
+      return SleepModel(
+        state: SleepState.sleep,
+        time: _timestampFromJson(decoded),
+        runtimeMs: _intFromAny(decoded['runtime_ms'] ?? decoded['ts_ms']),
+        confidence: _confidenceFromJson(decoded) ?? 1.0,
+        rawStatus: _rawStatusFromJson(decoded) ?? 'DROWSY',
+        signal: _intFromAny(decoded['signal']),
+        fatigue: _intFromAny(decoded['fatigue'] ?? decoded['fatigue_score']),
+        armed: _armedFromJson(decoded),
+        eventId: _stringFromAny(decoded['event_id']),
+        topic: 'driver/alert_event',
+      );
+    }
+
+    if (eventType == 'DROWSY_ALERT_RESOLVED' || resolved) {
+      final resolvedStatus =
+          _stringFromAny(decoded['resolved_status']) ??
+          _stringFromAny(decoded['status']) ??
+          'ATTENTIVE';
+      final resolvedState =
+          _stateFromJson(<String, dynamic>{
+            'status': resolvedStatus,
+            'signal': decoded['signal'],
+          }) ??
+          SleepState.normal;
+      return SleepModel(
+        state: resolvedState,
+        time: _timestampFromJson(decoded),
+        runtimeMs: _intFromAny(decoded['runtime_ms'] ?? decoded['ts_ms']),
+        confidence: _confidenceFromJson(decoded) ?? 0.4,
+        rawStatus: resolvedStatus.toUpperCase(),
+        signal: _intFromAny(decoded['signal']),
+        fatigue: _intFromAny(decoded['fatigue'] ?? decoded['fatigue_score']),
+        armed: _armedFromJson(decoded),
+        eventId: _stringFromAny(decoded['event_id']),
+        topic: 'driver/alert_event',
+      );
+    }
+
+    return null;
+  }
+
   SleepModel? _parseLegacyText(String payload) {
     try {
       final upper = payload.toUpperCase();
@@ -315,7 +410,7 @@ class MqttService {
 
       // final statusMatch = RegExp(r'STATUS:\s*([A-Z\s]+)').firstMatch(upper);
       final statusMatch = RegExp(
-        r'STATUS\s*:\s*([A-Z\s]+)',
+        r'STATUS\s*:\s*([A-Z_\s]+)',
         caseSensitive: false,
       ).firstMatch(payload);
       final fatigueMatch = RegExp(r'FATIGUE:\s*(\d+)').firstMatch(upper);
@@ -328,23 +423,31 @@ class MqttService {
 
       switch (statusRaw) {
         case 'MICROSLEEP':
+        case 'DROWSY':
+        case 'HEAD DOWN':
+        case 'HEAD_DOWN':
           state = SleepState.sleep;
           break;
 
         case 'ATTENTIVE':
+        case 'AWAKE':
+        case 'NO FACE':
+        case 'NO_FACE':
           state = SleepState.normal;
           break;
 
         case 'DISTRACTED':
         case 'HEAD TILT':
+        case 'HEAD_TILT':
         case 'LOOKING DOWN':
-        case 'LOOKING LEFT': 
-        case 'TIRED': 
+        case 'LOOKING LEFT':
+        case 'LOOKING RIGHT':
+        case 'LOOKING SIDE':
+        case 'TIRED':
+        case 'VERY TIRED':
+        case 'VERY_TIRED':
+        case 'SLEEPY':
           state = SleepState.sleepy;
-          break;
-
-        case 'NO FACE': 
-          state = SleepState.normal; 
           break;
 
         default:
@@ -367,6 +470,8 @@ class MqttService {
           Duration(milliseconds: math.Random().nextInt(5)),
         ),
         confidence: confidence,
+        rawStatus: statusRaw?.toUpperCase(),
+        topic: 'legacy/text',
       );
     } catch (e) {
       _debugLog('Parse TEXT error: $e');
@@ -380,11 +485,22 @@ class MqttService {
       return null;
     }
 
-    return SleepModel(state: state, time: DateTime.now(), confidence: 1.0);
+    return SleepModel(
+      state: state,
+      time: DateTime.now(),
+      confidence: 1.0,
+      signal: value,
+      topic: 'driver/status',
+    );
   }
 
   SleepState? _stateFromJson(Map<String, dynamic> jsonMap) {
-    final stateRaw = jsonMap['state'] ?? jsonMap['status'] ?? jsonMap['trigger_status'];
+    final stateRaw =
+        jsonMap['status_raw'] ??
+        jsonMap['raw_status'] ??
+        jsonMap['state'] ??
+        jsonMap['status'] ??
+        jsonMap['trigger_status'];
     final signalRaw = jsonMap['signal'];
 
     if (signalRaw is num) {
@@ -397,9 +513,30 @@ class MqttService {
 
     if (stateRaw is String) {
       final s = stateRaw.trim().toUpperCase();
-      if (s == 'MICROSLEEP' || s == 'SLEEP' || s == 'DROWSY' || s == 'HEAD DOWN') return SleepState.sleep;
-      if (s == 'SLEEPY' || s == 'TIRED' || s == 'VERY TIRED' || s == 'DISTRACTED' || s == 'LOOKING DOWN' || s == 'LOOKING LEFT' || s == 'LOOKING RIGHT' || s == 'HEAD TILT' || s == 'LOOKING SIDE') return SleepState.sleepy;
-      if (s == 'NORMAL' || s == 'ATTENTIVE' || s == 'AWAKE' || s == 'NO FACE') return SleepState.normal;
+      if (s == 'MICROSLEEP' ||
+          s == 'SLEEP' ||
+          s == 'DROWSY' ||
+          s == 'HEAD DOWN') {
+        return SleepState.sleep;
+      }
+      if (s == 'SLEEPY' ||
+          s == 'TIRED' ||
+          s == 'VERY TIRED' ||
+          s == 'DISTRACTED' ||
+          s == 'LOOKING DOWN' ||
+          s == 'LOOKING LEFT' ||
+          s == 'LOOKING RIGHT' ||
+          s == 'HEAD TILT' ||
+          s == 'LOOKING SIDE') {
+        return SleepState.sleepy;
+      }
+      if (s == 'NORMAL' ||
+          s == 'ATTENTIVE' ||
+          s == 'AWAKE' ||
+          s == 'NO FACE' ||
+          s == 'NO_FACE') {
+        return SleepState.normal;
+      }
 
       if (SleepStateX.isValidRaw(stateRaw)) {
         return SleepStateX.fromRaw(stateRaw);
@@ -414,6 +551,50 @@ class MqttService {
     return null;
   }
 
+  String? _rawStatusFromJson(Map<String, dynamic> jsonMap) {
+    final raw =
+        jsonMap['status_raw'] ??
+        jsonMap['raw_status'] ??
+        jsonMap['status'] ??
+        jsonMap['trigger_status'] ??
+        jsonMap['state'];
+    final text = _stringFromAny(raw);
+    return text?.toUpperCase();
+  }
+
+  int? _intFromAny(dynamic value) {
+    return switch (value) {
+      final int i => i,
+      final num n => n.toInt(),
+      final String s => int.tryParse(s.trim()),
+      _ => null,
+    };
+  }
+
+  String? _stringFromAny(dynamic value) {
+    if (value == null) return null;
+    final text = value.toString().trim();
+    if (text.isEmpty) return null;
+    return text;
+  }
+
+  bool? _armedFromJson(Map<String, dynamic> jsonMap) {
+    final raw = jsonMap['armed'];
+    return switch (raw) {
+      final bool b => b,
+      final num n => n != 0,
+      final String s =>
+        s.trim().toLowerCase() == 'true'
+            ? true
+            : (s.trim() == '1'
+                  ? true
+                  : (s.trim().toLowerCase() == 'false' || s.trim() == '0'
+                        ? false
+                        : null)),
+      _ => null,
+    };
+  }
+
   SleepState? _stateFromNumericCode(int? value) {
     if (value == null) {
       return null;
@@ -421,8 +602,8 @@ class MqttService {
 
     switch (value) {
       case 0:
-      case 1:
         return SleepState.normal;
+      case 1:
       case 2:
         return SleepState.sleepy;
       case 3:
@@ -461,27 +642,25 @@ class MqttService {
   }
 
   DateTime _timestampFromJson(Map<String, dynamic> jsonMap) {
-    final raw = jsonMap['time'] ?? jsonMap['ts_ms'] ?? jsonMap['timestamp_ms'];
+    final raw =
+        jsonMap['epoch_ms'] ??
+        jsonMap['time'] ??
+        jsonMap['timestamp_epoch_ms'] ??
+        jsonMap['timestamp_ms'] ??
+        jsonMap['ts_ms'];
 
     if (raw is int) {
-      return raw > 9999999999
-          ? DateTime.fromMillisecondsSinceEpoch(raw)
-          : DateTime.fromMillisecondsSinceEpoch(raw * 1000);
+      return _decodeTimestamp(raw);
     }
 
     if (raw is num) {
-      final value = raw.toInt();
-      return value > 9999999999
-          ? DateTime.fromMillisecondsSinceEpoch(value)
-          : DateTime.fromMillisecondsSinceEpoch(value * 1000);
+      return _decodeTimestamp(raw.toInt());
     }
 
     if (raw is String) {
       final parsedInt = int.tryParse(raw);
       if (parsedInt != null) {
-        return parsedInt > 9999999999
-            ? DateTime.fromMillisecondsSinceEpoch(parsedInt)
-            : DateTime.fromMillisecondsSinceEpoch(parsedInt * 1000);
+        return _decodeTimestamp(parsedInt);
       }
 
       final parsedDate = DateTime.tryParse(raw);
@@ -491,6 +670,28 @@ class MqttService {
     }
 
     return DateTime.now();
+  }
+
+  DateTime _decodeTimestamp(int raw) {
+    // Treat old/non-epoch values (e.g. monotonic ts_ms from Pi) as "received now".
+    final now = DateTime.now();
+    DateTime? candidate;
+    if (raw >= 1000000000000) {
+      candidate = DateTime.fromMillisecondsSinceEpoch(raw);
+    } else if (raw >= 1000000000 && raw < 10000000000) {
+      candidate = DateTime.fromMillisecondsSinceEpoch(raw * 1000);
+    }
+    if (candidate == null) {
+      return now;
+    }
+
+    const int maxSkewMs = 5 * 365 * 24 * 60 * 60 * 1000;
+    final skewMs =
+        (candidate.millisecondsSinceEpoch - now.millisecondsSinceEpoch).abs();
+    if (skewMs > maxSkewMs) {
+      return now;
+    }
+    return candidate;
   }
 
   void _onUpdatesError(Object error, [StackTrace? stackTrace]) {

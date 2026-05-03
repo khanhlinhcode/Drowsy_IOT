@@ -9,7 +9,7 @@ class DbHelper {
   static final DbHelper instance = DbHelper._internal();
 
   static const String _databaseName = 'sleep_monitor.db';
-  static const int _databaseVersion = 2;
+  static const int _databaseVersion = 4;
   static const String _tableName = 'sleep_records';
   static const int maxRows = 2000;
 
@@ -31,14 +31,21 @@ class DbHelper {
           CREATE TABLE $_tableName (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             state TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            timestamp INTEGER NOT NULL
+            confidence REAL NOT NULL DEFAULT 0.0,
+            timestamp INTEGER NOT NULL,
+            runtime_ms INTEGER,
+            raw_status TEXT,
+            signal INTEGER,
+            fatigue INTEGER,
+            armed INTEGER,
+            face_lock INTEGER,
+            face_in_frame INTEGER,
+            event_id TEXT,
+            topic TEXT
           )
         ''');
 
-        await db.execute(
-          'CREATE INDEX idx_sleep_records_timestamp ON $_tableName(timestamp)',
-        );
+        await _ensureIndexes(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -46,8 +53,54 @@ class DbHelper {
             'ALTER TABLE $_tableName ADD COLUMN confidence REAL NOT NULL DEFAULT 0.0',
           );
         }
+        if (oldVersion < 3) {
+          await _ensureSchema(db);
+        }
+        if (oldVersion < 4) {
+          await _ensureSchema(db);
+        }
+      },
+      onOpen: (db) async {
+        await _ensureSchema(db);
+        await _ensureIndexes(db);
       },
     );
+  }
+
+  Future<void> _ensureIndexes(Database db) async {
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_sleep_records_timestamp ON $_tableName(timestamp)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_sleep_records_event_id ON $_tableName(event_id)',
+    );
+  }
+
+  Future<void> _ensureSchema(Database db) async {
+    final columns = await db.rawQuery('PRAGMA table_info($_tableName)');
+    final names = <String>{
+      for (final row in columns)
+        (row['name']?.toString() ?? '').trim().toLowerCase(),
+    };
+
+    Future<void> addIfMissing(String columnSql, String columnName) async {
+      if (names.contains(columnName.toLowerCase())) {
+        return;
+      }
+      await db.execute('ALTER TABLE $_tableName ADD COLUMN $columnSql');
+      names.add(columnName.toLowerCase());
+    }
+
+    await addIfMissing('confidence REAL NOT NULL DEFAULT 0.0', 'confidence');
+    await addIfMissing('runtime_ms INTEGER', 'runtime_ms');
+    await addIfMissing('raw_status TEXT', 'raw_status');
+    await addIfMissing('signal INTEGER', 'signal');
+    await addIfMissing('fatigue INTEGER', 'fatigue');
+    await addIfMissing('armed INTEGER', 'armed');
+    await addIfMissing('face_lock INTEGER', 'face_lock');
+    await addIfMissing('face_in_frame INTEGER', 'face_in_frame');
+    await addIfMissing('event_id TEXT', 'event_id');
+    await addIfMissing('topic TEXT', 'topic');
   }
 
   Future<void> insertSleepRecord(SleepModel entry) async {

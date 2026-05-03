@@ -8,7 +8,9 @@ import '../widgets/glass_card.dart';
 import '../widgets/stats_card.dart';
 
 class StatsScreen extends StatelessWidget {
-  const StatsScreen({super.key});
+  const StatsScreen({super.key, this.showBackButton = true});
+
+  final bool showBackButton;
 
   @override
   Widget build(BuildContext context) {
@@ -17,6 +19,10 @@ class StatsScreen extends StatelessWidget {
     final avgConfidence = context.select(
       (SleepProvider p) => p.averageConfidence,
     );
+    final driveDuration = context.select(
+      (SleepProvider p) => p.driveDurationLabel,
+    );
+    final sleepGap = context.select((SleepProvider p) => p.lastSleepGapLabel);
     final totalSamples = history.length;
 
     return Scaffold(
@@ -26,113 +32,117 @@ class StatsScreen extends StatelessWidget {
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: <Color>[
-              Color(0xFF080F21),
-              Color(0xFF1A2042),
-              Color(0xFF30204B),
+              Color(0xFF070E1A),
+              Color(0xFF111B32),
+              Color(0xFF1E1838),
             ],
             stops: <double>[0, 0.55, 1],
           ),
         ),
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
             child: Column(
               children: <Widget>[
+                // ── Header ──────────────────────────────────────────
                 Row(
                   children: <Widget>[
-                    _RoundIconButton(
-                      icon: CupertinoIcons.back,
-                      onTap: () => Navigator.of(context).pop(),
-                    ),
-                    const SizedBox(width: 12),
-                    Hero(
-                      tag: 'stats_nav_hero',
-                      child: Material(
-                        color: Colors.transparent,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 10,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.16),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: 0.35),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: <Widget>[
-                              const Icon(
-                                CupertinoIcons.chart_bar_alt_fill,
-                                color: Colors.white,
-                                size: 18,
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                'Statistics',
-                                style: Theme.of(context).textTheme.titleMedium
-                                    ?.copyWith(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                              ),
-                            ],
-                          ),
+                    if (showBackButton)
+                      _RoundIconButton(
+                        icon: CupertinoIcons.back,
+                        onTap: () => Navigator.of(context).pop(),
+                      ),
+                    if (showBackButton) const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Statistics',
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 20,
+                          letterSpacing: -0.3,
                         ),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 16),
+
+                // ── Content ─────────────────────────────────────────
                 Expanded(
                   child: ListView(
                     physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.only(bottom: 100),
                     children: <Widget>[
+                      // Chart Card
                       GlassCard(
                         padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
-                        gradientColors: <Color>[
-                          Colors.white.withValues(alpha: 0.21),
-                          Colors.white.withValues(alpha: 0.08),
-                        ],
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
-                            Text(
-                              'Realtime Trend',
-                              style: Theme.of(context).textTheme.titleLarge
-                                  ?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
+                            Row(
+                              children: <Widget>[
+                                Container(
+                                  width: 6,
+                                  height: 6,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: const Color(0xFF60A5FA),
+                                    boxShadow: <BoxShadow>[
+                                      BoxShadow(
+                                        color: const Color(0xFF60A5FA)
+                                            .withValues(alpha: 0.50),
+                                        blurRadius: 6,
+                                      ),
+                                    ],
                                   ),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  'Realtime Trend',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .titleMedium
+                                      ?.copyWith(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w700,
+                                        fontSize: 16,
+                                      ),
+                                ),
+                              ],
                             ),
-                            const SizedBox(height: 6),
+                            const SizedBox(height: 4),
                             Text(
-                              'State (0 / 0.5 / 1) and confidence over time',
-                              style: Theme.of(context).textTheme.bodySmall
+                              'State & confidence over time',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
                                   ?.copyWith(
-                                    color: Colors.white70,
+                                    color:
+                                        Colors.white.withValues(alpha: 0.35),
                                     fontWeight: FontWeight.w500,
+                                    fontSize: 11,
                                   ),
                             ),
-                            const SizedBox(height: 14),
+                            const SizedBox(height: 16),
                             SizedBox(
-                              height: 320,
+                              height: 300,
                               child: ChartWidget(data: history),
                             ),
                           ],
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 10),
+
+                      // Stats Grid
                       Row(
                         children: <Widget>[
                           Expanded(
                             child: StatsCard(
-                              title: 'Sleep Count',
+                              title: 'Sleep Events',
                               value: sleepCount.toString(),
-                              subtitle: 'Critical events',
-                              accent: const Color(0xFFFF5A71),
+                              subtitle: 'Critical drowsy detections',
+                              accent: const Color(0xFFF87171),
                             ),
                           ),
                           const SizedBox(width: 10),
@@ -141,8 +151,30 @@ class StatsScreen extends StatelessWidget {
                               title: 'Avg Confidence',
                               value:
                                   '${(avgConfidence * 100).toStringAsFixed(1)}%',
-                              subtitle: 'Model certainty',
-                              accent: const Color(0xFF52A8FF),
+                              subtitle: 'Model certainty level',
+                              accent: const Color(0xFF60A5FA),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: StatsCard(
+                              title: 'Drive Time',
+                              value: driveDuration,
+                              subtitle: 'Current trip duration',
+                              accent: const Color(0xFF34D399),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: StatsCard(
+                              title: 'Sleep Gap',
+                              value: sleepGap,
+                              subtitle: 'Between last 2 events',
+                              accent: const Color(0xFFFBBF24),
                             ),
                           ),
                         ],
@@ -152,7 +184,7 @@ class StatsScreen extends StatelessWidget {
                         title: 'Total Samples',
                         value: totalSamples.toString(),
                         subtitle: 'Realtime records in memory',
-                        accent: const Color(0xFF36E18A),
+                        accent: const Color(0xFF34D399),
                       ),
                     ],
                   ),
@@ -199,16 +231,23 @@ class _RoundIconButtonState extends State<_RoundIconButton> {
       child: AnimatedScale(
         duration: const Duration(milliseconds: 130),
         curve: Curves.easeOutCubic,
-        scale: _pressed ? 0.94 : 1,
+        scale: _pressed ? 0.92 : 1,
         child: Container(
-          width: 40,
-          height: 40,
+          width: 38,
+          height: 38,
           decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.15),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.32)),
+            color: Colors.white.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(11),
+            border: Border.all(
+              color: Colors.white.withValues(alpha: 0.10),
+              width: 0.5,
+            ),
           ),
-          child: Icon(widget.icon, color: Colors.white),
+          child: Icon(
+            widget.icon,
+            color: Colors.white.withValues(alpha: 0.70),
+            size: 18,
+          ),
         ),
       ),
     );

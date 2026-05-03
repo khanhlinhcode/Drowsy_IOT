@@ -1,0 +1,50 @@
+[Unit]
+Description=Drowsy Edge Detection (Auto start after WiFi/MQTT/Camera/Display ready)
+After=esp32-wifi-sync.service network-online.target display-manager.service mosquitto.service
+Wants=esp32-wifi-sync.service network-online.target mosquitto.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+Environment=PYTHONUNBUFFERED=1
+Environment=INTERNAL_WIFI_SYNC_ENABLED=0
+Environment=DISPLAY=__DISPLAY__
+Environment=XAUTHORITY=__XAUTHORITY__
+Environment=DISPLAY_WAIT_TIMEOUT_S=__DISPLAY_WAIT_TIMEOUT_S__
+Environment=QT_QPA_FONTDIR=__QT_QPA_FONTDIR__
+Environment=PI_WIFI_INTERFACE=__PI_WIFI_INTERFACE__
+Environment=WIFI_READY_TIMEOUT_S=__WIFI_READY_TIMEOUT_S__
+Environment=REQUIRE_WIFI_AT_START=__REQUIRE_WIFI_AT_START__
+Environment=CAMERA_SOURCE=__CAMERA_SOURCE__
+Environment=CAMERA_READY_TIMEOUT_S=__CAMERA_READY_TIMEOUT_S__
+Environment=MQTT_BROKER=__MQTT_BROKER__
+Environment=MQTT_PORT=__MQTT_PORT__
+Environment=MQTT_READY_TIMEOUT_S=__MQTT_READY_TIMEOUT_S__
+Environment=REQUIRE_MQTT_AT_START=__REQUIRE_MQTT_AT_START__
+Environment=NETWORK_SEND_REQUIRE_WIFI=__NETWORK_SEND_REQUIRE_WIFI__
+Environment=NETWORK_CHECK_MS=__NETWORK_CHECK_MS__
+Environment=EDGE_DEVICE_ID=__EDGE_DEVICE_ID__
+Environment=CLOUD_API_BASE_URL=__CLOUD_API_BASE_URL__
+Environment=CLOUD_API_TOKEN=__CLOUD_API_TOKEN__
+Environment=CLOUD_PUSH_TIMEOUT_S=__CLOUD_PUSH_TIMEOUT_S__
+Environment=CLOUD_HEARTBEAT_MS=__CLOUD_HEARTBEAT_MS__
+Environment=CLOUD_STATUS_MIN_MS=__CLOUD_STATUS_MIN_MS__
+Environment=ESP32_WIFI_SERIAL_PORT=__ESP32_WIFI_SERIAL_PORT__
+Environment=ESP32_WIFI_SERIAL_BAUD=__ESP32_WIFI_SERIAL_BAUD__
+ExecStartPre=/bin/bash __WORKDIR__/wait_drowsy_prereqs.sh
+ExecStart=__PYTHON_BIN__ __WORKDIR__/drowsy_edge.py __DROWSY_EDGE_ARGS__
+Restart=always
+RestartSec=2
+TimeoutStartSec=0
+TimeoutStopSec=15
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=graphical.target
+WantedBy=esp32-wifi-sync.service

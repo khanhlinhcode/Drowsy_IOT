@@ -9,6 +9,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 
 import '../database/db_helper.dart';
 import '../models/sleep_model.dart';
+import '../services/edge_api_service.dart';
 import '../services/firebase_service.dart';
 import '../services/local_notification_service.dart';
 import '../services/mqtt_service.dart';
@@ -20,6 +21,7 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     required String userId,
     DbHelper? dbHelper,
     MqttService? mqttService,
+    EdgeApiService? edgeApiService,
     LocalNotificationService? notificationService,
     FirebaseService? firebaseService,
     FlutterTts? tts,
@@ -44,12 +46,29 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
                allowInsecureCertificates: defaultAllowInsecureCertificates,
                enableDebugLogs: enableMqttDebugLogs,
              ),
-           );
+           ),
+       _edgeApiService =
+           edgeApiService ??
+           ((_enableEdgeApiPull && _edgeApiBaseUrl.trim().isNotEmpty)
+               ? EdgeApiService(
+                   config: EdgeApiConfig(
+                     baseUrl: _edgeApiBaseUrl,
+                     deviceId: _edgeDeviceId.trim().isNotEmpty
+                         ? _edgeDeviceId.trim()
+                         : 'rpi-drowsy-edge',
+                     apiToken: _edgeApiToken.trim().isEmpty
+                         ? null
+                         : _edgeApiToken.trim(),
+                     pollIntervalMs: _edgeApiPollMs,
+                     timeoutSeconds: _edgeApiTimeoutS,
+                     enableDebugLogs: enableMqttDebugLogs,
+                   ),
+                 )
+               : null);
 
   static const String defaultBroker = String.fromEnvironment(
     'MQTT_BROKER',
-    // defaultValue: '192.168.0.163',
-    defaultValue: '172.20.10.2',
+    defaultValue: 'raspberrypi.local',
   );
 
   static const int defaultPort = int.fromEnvironment(
@@ -86,14 +105,60 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
   //   'MQTT_TOPIC_PATTERN',
   //   defaultValue: 'driver/{userId}/status',
   // );
-  static const String _topicPattern = 'driver/status';
+  static const String _topicPattern = 'driver/#';
   static const bool _enableCloudPull = bool.fromEnvironment(
     'CLOUD_PULL_ENABLED',
+    defaultValue: false,
+  );
+  // Server-only mode: app reads data from Edge API, MQTT feed disabled.
+  static const bool _enableMqttPull = false;
+  static const bool _enableEdgeApiPull = bool.fromEnvironment(
+    'EDGE_API_ENABLED',
     defaultValue: true,
+  );
+  static const String _edgeApiBaseUrl = String.fromEnvironment(
+    'EDGE_API_BASE_URL',
+    defaultValue: 'http://raspberrypi.local:8787',
+  );
+  static const String _edgeApiToken = String.fromEnvironment(
+    'EDGE_API_TOKEN',
+    defaultValue: 'drowsy_token_2026',
+  );
+  static const String _edgeDeviceId = String.fromEnvironment(
+    'EDGE_DEVICE_ID',
+    defaultValue: 'rpi-drowsy-edge',
+  );
+  static const int _edgeApiPollMs = int.fromEnvironment(
+    'EDGE_API_POLL_MS',
+    defaultValue: 1000,
+  );
+  static const int _edgeApiTimeoutS = int.fromEnvironment(
+    'EDGE_API_TIMEOUT_S',
+    defaultValue: 4,
+  );
+  static const int _edgeConnectedFreshMs = int.fromEnvironment(
+    'EDGE_CONNECTED_FRESH_MS',
+    defaultValue: 4000,
+  );
+  static const int _edgeReconnectGraceMs = int.fromEnvironment(
+    'EDGE_RECONNECT_GRACE_MS',
+    defaultValue: 10000,
+  );
+  static const int _restWindowMs = int.fromEnvironment(
+    'REST_WINDOW_MS',
+    defaultValue: 120000,
+  );
+  static const int _restTriggerCount = int.fromEnvironment(
+    'REST_TRIGGER_COUNT',
+    defaultValue: 2,
+  );
+  static const int _restAlertCooldownMs = int.fromEnvironment(
+    'REST_ALERT_COOLDOWN_MS',
+    defaultValue: 120000,
   );
 
   static const int historyLimit = 1000;
-  static const int _minAcceptedGapMs = 0;
+  static const int _minAcceptedGapMs = 900;
 
   // static const int _stateHoldMs = 200;
   static const int _stateHoldMs = 0;
@@ -113,6 +178,7 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
   final String _userId;
   final DbHelper _dbHelper;
   final MqttService _mqttService;
+  final EdgeApiService? _edgeApiService;
   final FirebaseService _firebaseService;
   final LocalNotificationService _notificationService;
   final FlutterTts _tts;
@@ -126,6 +192,7 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
   StreamSubscription<MqttFeedStatus>? _statusSubscription;
 
   Timer? _notifyTimer;
+  Timer? _edgeHealthTimer;
   int _lastNotifyAtMs = 0;
 
   SleepModel? _current;
@@ -138,9 +205,18 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
   SleepState? _lastAcceptedState;
   int _lastAcceptedAtMs = 0;
 
-  String? _lastAlertSignature;
   int _lastAlertAtMs = 0;
   String? _lastSpokenSignature;
+  int? _driveSessionStartEpochMs;
+  int _driveSessionLastEpochMs = 0;
+  int? _driveSessionStartRuntimeMs;
+  int? _driveSessionLastRuntimeMs;
+  final ListQueue<int> _sleepEventWindowMs = ListQueue<int>();
+  int? _lastSleepEventMs;
+  int? _lastSleepGapMs;
+  bool _isRestAlertPending = false;
+  int _lastRestAlertAtMs = 0;
+  String? _lastRestSpokenSignature;
 
   AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
 
@@ -165,10 +241,37 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   List<SleepModel> get history => List<SleepModel>.unmodifiable(_history);
   SleepModel? get current => _current;
+  String get currentRawStatus =>
+      _current?.rawStatus ??
+      switch (_current?.state ?? SleepState.normal) {
+        SleepState.sleep => 'MICROSLEEP',
+        SleepState.sleepy => 'SLEEPY',
+        SleepState.normal => 'ATTENTIVE',
+      };
+  bool get isDetectionArmed => _current?.armed ?? true;
+  bool get isFaceInFrame {
+    final sample = _current;
+    if (sample == null) {
+      return false;
+    }
+    if (sample.faceInFrame != null) {
+      return sample.faceInFrame!;
+    }
+    final raw = (sample.rawStatus ?? '').trim().toUpperCase();
+    if (raw.isEmpty) {
+      return false;
+    }
+    return raw != 'NO FACE' && raw != 'NO_FACE';
+  }
+
+  bool get isFaceLocked => _current?.faceLock ?? false;
+  int? get currentFatigue => _current?.fatigue;
+  int? get currentSignal => _current?.signal;
   MqttFeedStatus get connectionStatus => _connectionStatus;
 
   bool get isLoading => _isLoading;
   bool get shouldShowSleepAlert => _isSleepAlertPending;
+  bool get shouldShowRestAlert => _isRestAlertPending;
   String? get error => _error;
 
   bool get isConnected => _connectionStatus == MqttFeedStatus.connected;
@@ -183,6 +286,29 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   int get latestLatencyMs => _latestLatencyMs;
   int get averageLatencyMs => _averageLatencyMs.round();
+  int get recentSleepEvents2m => _sleepEventWindowMs.length;
+
+  Duration get driveDuration {
+    return Duration(milliseconds: _resolveDriveDurationMs());
+  }
+
+  String get driveDurationLabel => _formatDuration(driveDuration);
+
+  Duration? get lastSleepGap {
+    final ms = _lastSleepGapMs;
+    if (ms == null || ms <= 0) {
+      return null;
+    }
+    return Duration(milliseconds: ms);
+  }
+
+  String get lastSleepGapLabel {
+    final gap = lastSleepGap;
+    if (gap == null) {
+      return '--';
+    }
+    return _formatDuration(gap);
+  }
 
   String get connectionQuality {
     if (isDisconnected) {
@@ -235,28 +361,40 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     _initialized = true;
 
+    if (enableMqttDebugLogs && kDebugMode) {
+      final edgeTokenState = _edgeApiToken.trim().isEmpty ? 'empty' : 'set';
+      debugPrint(
+        '[DATA_SOURCE] mqttPull=$_enableMqttPull edgeApiPull=$_enableEdgeApiPull '
+        'edgeBase=$_edgeApiBaseUrl edgeDevice=$_edgeDeviceId edgeToken=$edgeTokenState',
+      );
+    }
+
     WidgetsBinding.instance.addObserver(this);
 
     await _notificationService.initialize();
     await _initializeTts();
     await _loadHistory();
 
-    _statusSubscription = _mqttService.connectionStatus.listen(
-      _onConnectionStatusChanged,
-    );
+    if (_enableMqttPull) {
+      _statusSubscription = _mqttService.connectionStatus.listen(
+        _onConnectionStatusChanged,
+      );
 
-    _messageSubscription = _mqttService.messages.listen(
-      _onMqttData,
-      onError: (Object error) {
-        _setError(error.toString());
-      },
-    );
+      _messageSubscription = _mqttService.messages.listen(
+        _onMqttData,
+        onError: (Object error) {
+          _setError(error.toString());
+        },
+      );
 
-    if (_enableCloudPull) {
-      _startCloudPull();
+      await _mqttService.connect();
+    } else {
+      _connectionStatus = MqttFeedStatus.disconnected;
     }
 
-    await _mqttService.connect();
+    if (_enableEdgeApiPull || _enableCloudPull) {
+      _startCloudPull();
+    }
   }
 
   @override
@@ -267,7 +405,7 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
 
-    if (state == AppLifecycleState.resumed && !isConnected) {
+    if (_enableMqttPull && state == AppLifecycleState.resumed && !isConnected) {
       unawaited(_mqttService.connect());
     }
   }
@@ -344,16 +482,46 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   void _startCloudPull() {
     _cloudSubscription?.cancel();
-    _cloudSubscription = _firebaseService
-        .streamRecordChanges(userId: _userId, limit: historyLimit)
-        .listen(
-          _onCloudData,
-          onError: (_) {
-            if (_error == null) {
-              _setError('Cloud sync unavailable. Running in local-only mode.');
-            }
-          },
-        );
+    _edgeHealthTimer?.cancel();
+    _edgeHealthTimer = null;
+
+    final edgeApi = _edgeApiService;
+    if (_enableEdgeApiPull && edgeApi != null) {
+      if (!_enableMqttPull) {
+        _connectionStatus = MqttFeedStatus.connecting;
+        _error = null;
+        _notifySafely(immediate: true);
+      }
+      _cloudSubscription = edgeApi.stream.listen(
+        _onCloudData,
+        onError: (_) {
+          if (!_enableMqttPull && _connectionStatus != MqttFeedStatus.error) {
+            _connectionStatus = MqttFeedStatus.error;
+          }
+          if (_error == null) {
+            _setError('Edge API unavailable. Running in local-only mode.');
+          }
+        },
+      );
+      _startEdgeHealthMonitor();
+      unawaited(edgeApi.start());
+      return;
+    }
+
+    if (_enableCloudPull) {
+      _cloudSubscription = _firebaseService
+          .streamRecordChanges(userId: _userId, limit: historyLimit)
+          .listen(
+            _onCloudData,
+            onError: (_) {
+              if (_error == null) {
+                _setError(
+                  'Cloud sync unavailable. Running in local-only mode.',
+                );
+              }
+            },
+          );
+    }
   }
 
   void _onMqttData(SleepModel incoming) {
@@ -367,7 +535,51 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void _onCloudData(SleepModel incoming) {
+    _updateLatency(incoming);
+    if (!_enableMqttPull && _connectionStatus != MqttFeedStatus.connected) {
+      _connectionStatus = MqttFeedStatus.connected;
+      _error = null;
+      _notifySafely();
+    }
     _processIncoming(incoming, source: _SampleSource.cloud);
+  }
+
+  void _startEdgeHealthMonitor() {
+    if (_enableMqttPull || _edgeApiService == null) {
+      return;
+    }
+
+    _edgeHealthTimer?.cancel();
+    _edgeHealthTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_isDisposed || _enableMqttPull) {
+        return;
+      }
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final lastMs = _lastMessageAtMs;
+      MqttFeedStatus nextStatus;
+      if (lastMs <= 0) {
+        nextStatus = MqttFeedStatus.connecting;
+      } else {
+        final ageMs = nowMs - lastMs;
+        if (ageMs <= _edgeConnectedFreshMs) {
+          nextStatus = MqttFeedStatus.connected;
+        } else if (ageMs <= _edgeReconnectGraceMs) {
+          nextStatus = MqttFeedStatus.reconnecting;
+        } else {
+          nextStatus = MqttFeedStatus.disconnected;
+        }
+      }
+      if (nextStatus != _connectionStatus) {
+        _connectionStatus = nextStatus;
+        if (nextStatus == MqttFeedStatus.connected) {
+          _error = null;
+        } else if (nextStatus == MqttFeedStatus.disconnected &&
+            (_error == null || _error!.isEmpty)) {
+          _error = 'Edge API disconnected. Retrying...';
+        }
+        _notifySafely();
+      }
+    });
   }
 
   void _processIncoming(SleepModel incoming, {required _SampleSource source}) {
@@ -384,7 +596,7 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     if (source == _SampleSource.mqtt) {
       final receivedAtMs = DateTime.now().millisecondsSinceEpoch;
-      if (!_shouldAcceptIncoming(incoming.state, receivedAtMs)) {
+      if (!_shouldAcceptIncoming(incoming, receivedAtMs)) {
         return;
       }
 
@@ -422,7 +634,8 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     _commitSample(incoming, source: source, previousState: _current?.state);
   }
 
-  bool _shouldAcceptIncoming(SleepState newState, int receivedAtMs) {
+  bool _shouldAcceptIncoming(SleepModel incoming, int receivedAtMs) {
+    final newState = incoming.state;
     final previousAcceptedState = _lastAcceptedState;
     final previousAcceptedAtMs = _lastAcceptedAtMs;
 
@@ -433,6 +646,22 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     if (newState != previousAcceptedState) {
+      _lastAcceptedState = newState;
+      _lastAcceptedAtMs = receivedAtMs;
+      return true;
+    }
+
+    final current = _current;
+    final detailChanged =
+        current == null ||
+        incoming.rawStatus != current.rawStatus ||
+        incoming.armed != current.armed ||
+        incoming.faceLock != current.faceLock ||
+        incoming.faceInFrame != current.faceInFrame ||
+        incoming.runtimeMs != current.runtimeMs ||
+        incoming.signal != current.signal ||
+        incoming.fatigue != current.fatigue;
+    if (detailChanged) {
       _lastAcceptedState = newState;
       _lastAcceptedAtMs = receivedAtMs;
       return true;
@@ -487,26 +716,28 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     required _SampleSource source,
     required SleepState? previousState,
   }) {
-    final key = _eventKey(sample);
+    final wasCurrent = _current;
+    final mergedSample = sample.withMissingFrom(wasCurrent);
+    final key = _eventKey(mergedSample);
     _markEventSeen(key);
 
-    _insertIntoHistory(sample);
+    _insertIntoHistory(mergedSample);
 
-    final wasCurrent = _current;
     final shouldUpdateCurrent =
         wasCurrent == null ||
-        sample.time.isAfter(wasCurrent.time) ||
-        sample.time.millisecondsSinceEpoch ==
+        mergedSample.time.isAfter(wasCurrent.time) ||
+        mergedSample.time.millisecondsSinceEpoch ==
             wasCurrent.time.millisecondsSinceEpoch;
 
     if (shouldUpdateCurrent) {
-      _current = sample;
+      _current = mergedSample;
+      _touchDriveSession(mergedSample);
 
       if (source == _SampleSource.mqtt) {
-        _stableState = sample.state;
+        _stableState = mergedSample.state;
       }
 
-      _handleAlerts(previousState ?? wasCurrent?.state, sample);
+      _handleAlerts(previousState ?? wasCurrent?.state, mergedSample);
     }
 
     _recalculateAggregates();
@@ -514,10 +745,10 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     // giữ cái này cho background update
     _notifySafely();
 
-    unawaited(_persist(sample));
+    unawaited(_persist(mergedSample));
 
     if (source == _SampleSource.mqtt) {
-      unawaited(_syncToCloud(sample));
+      unawaited(_syncToCloud(mergedSample));
     }
   }
 
@@ -556,10 +787,118 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  void _touchDriveSession(SleepModel entry) {
+    final nowEpochMs = DateTime.now().millisecondsSinceEpoch;
+    final eventEpochMs = entry.time.millisecondsSinceEpoch;
+    final safeEpochMs = eventEpochMs > 0 ? eventEpochMs : nowEpochMs;
+    _driveSessionLastEpochMs = safeEpochMs;
+
+    final runtimeMs = entry.runtimeMs;
+    if (runtimeMs != null && runtimeMs > 0) {
+      final prevRuntime = _driveSessionLastRuntimeMs;
+      if (prevRuntime != null && runtimeMs + 1500 < prevRuntime) {
+        // Pi reboot / monotonic counter reset: restart trip timeline.
+        _driveSessionStartRuntimeMs = null;
+        _driveSessionStartEpochMs = null;
+      }
+      _driveSessionLastRuntimeMs = runtimeMs;
+    }
+
+    final faceReady = (entry.faceLock ?? false) || (entry.faceInFrame ?? false);
+    final armedReady = entry.armed ?? false;
+    final ready = faceReady || armedReady;
+
+    if (ready && _driveSessionStartEpochMs == null) {
+      _driveSessionStartEpochMs = safeEpochMs;
+      if (runtimeMs != null && runtimeMs > 0) {
+        _driveSessionStartRuntimeMs = runtimeMs;
+      }
+    } else if (ready &&
+        _driveSessionStartRuntimeMs == null &&
+        runtimeMs != null &&
+        runtimeMs > 0) {
+      _driveSessionStartRuntimeMs = runtimeMs;
+    }
+  }
+
+  int _resolveDriveDurationMs() {
+    const maxDurationMs = 864000000; // 10 days safety cap
+    final nowEpochMs = DateTime.now().millisecondsSinceEpoch;
+
+    final startRuntimeMs = _driveSessionStartRuntimeMs;
+    final lastRuntimeMs = _driveSessionLastRuntimeMs;
+    if (startRuntimeMs != null &&
+        lastRuntimeMs != null &&
+        lastRuntimeMs >= startRuntimeMs) {
+      var deltaMs = lastRuntimeMs - startRuntimeMs;
+      if (isConnected && _lastMessageAtMs > 0) {
+        final extrapolateMs = (nowEpochMs - _lastMessageAtMs).clamp(0, 5000);
+        deltaMs += extrapolateMs;
+      }
+      return deltaMs.clamp(0, maxDurationMs);
+    }
+
+    final startEpochMs = _driveSessionStartEpochMs;
+    if (startEpochMs == null) {
+      return 0;
+    }
+    final endEpochMs = isConnected
+        ? nowEpochMs
+        : (_driveSessionLastEpochMs > 0
+              ? _driveSessionLastEpochMs
+              : nowEpochMs);
+    return (endEpochMs - startEpochMs).clamp(0, maxDurationMs);
+  }
+
+  void _recordSleepEventForRestAlert(int eventMs, int nowMs) {
+    if (_lastSleepEventMs != null) {
+      final gap = eventMs - _lastSleepEventMs!;
+      if (gap > 0) {
+        _lastSleepGapMs = gap;
+      }
+    }
+    _lastSleepEventMs = eventMs;
+
+    _sleepEventWindowMs.addLast(eventMs);
+    while (_sleepEventWindowMs.isNotEmpty &&
+        (eventMs - _sleepEventWindowMs.first) > _restWindowMs) {
+      _sleepEventWindowMs.removeFirst();
+    }
+
+    final shouldRaiseRestAlert =
+        _sleepEventWindowMs.length >= _restTriggerCount &&
+        (nowMs - _lastRestAlertAtMs) >= _restAlertCooldownMs;
+
+    if (!shouldRaiseRestAlert) {
+      return;
+    }
+
+    _lastRestAlertAtMs = nowMs;
+    _isRestAlertPending = true;
+
+    if (_isForeground) {
+      HapticFeedback.mediumImpact();
+    } else {
+      _notificationService.showRestBreakAlert(
+        recentCount: _sleepEventWindowMs.length,
+        windowMs: _restWindowMs,
+        eventTimestampMs: eventMs,
+        dedupKey: 'rest-$eventMs',
+      );
+    }
+
+    _speakRestWarning('rest-$eventMs');
+    _notifySafely(immediate: true);
+  }
+
   void _handleAlerts(SleepState? previousState, SleepModel entry) {
     if (entry.state != SleepState.sleep) return;
+    if (previousState == SleepState.sleep) return;
+    if (entry.armed == false) return;
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final eventMs = entry.time.millisecondsSinceEpoch;
+    _recordSleepEventForRestAlert(eventMs, nowMs);
 
     if ((nowMs - _lastAlertAtMs) < _alertCooldownMs) return;
 
@@ -576,6 +915,8 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     } else {
       _notificationService.showSleepAlert(
         confidence: entry.confidence,
+        statusLabel: entry.rawStatus,
+        fatigue: entry.fatigue,
         eventTimestampMs: entry.time.millisecondsSinceEpoch,
         dedupKey: '$nowMs',
       );
@@ -599,6 +940,26 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
       await _tts.stop();
       await _tts.speak(
         'Warning. Sleep detected. Please pull over and take a break.',
+      );
+    } catch (_) {
+      // Ignore TTS failures.
+    }
+  }
+
+  Future<void> _speakRestWarning(String signature) async {
+    if (!_isTtsReady || !_isForeground) {
+      return;
+    }
+
+    if (_lastRestSpokenSignature == signature) {
+      return;
+    }
+    _lastRestSpokenSignature = signature;
+
+    try {
+      await _tts.stop();
+      await _tts.speak(
+        'Driver alert. Multiple drowsy events detected. Please take a rest break now.',
       );
     } catch (_) {
       // Ignore TTS failures.
@@ -650,11 +1011,23 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     return a.state == b.state &&
-        a.time.millisecondsSinceEpoch == b.time.millisecondsSinceEpoch;
+        a.time.millisecondsSinceEpoch == b.time.millisecondsSinceEpoch &&
+        a.rawStatus == b.rawStatus &&
+        a.armed == b.armed &&
+        a.faceLock == b.faceLock &&
+        a.faceInFrame == b.faceInFrame &&
+        a.runtimeMs == b.runtimeMs &&
+        a.signal == b.signal &&
+        a.fatigue == b.fatigue &&
+        a.eventId == b.eventId;
   }
 
   String _eventKey(SleepModel record) {
-    return '${record.state.rawValue}-${record.time.millisecondsSinceEpoch}';
+    final eventId = record.eventId;
+    if (eventId != null && eventId.isNotEmpty) {
+      return 'evt-$eventId-${record.state.rawValue}-${record.topic ?? ''}';
+    }
+    return '${record.state.rawValue}-${record.time.millisecondsSinceEpoch}-${record.runtimeMs ?? -1}-${record.rawStatus ?? ''}-${record.signal ?? -1}-${record.fatigue ?? -1}-${record.armed == null ? 'u' : (record.armed! ? '1' : '0')}-${record.faceLock == null ? 'u' : (record.faceLock! ? '1' : '0')}-${record.faceInFrame == null ? 'u' : (record.faceInFrame! ? '1' : '0')}';
   }
 
   void _markEventSeen(String key) {
@@ -709,6 +1082,14 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     _notifySafely(immediate: true);
   }
 
+  void acknowledgeRestAlert() {
+    if (!_isRestAlertPending) {
+      return;
+    }
+    _isRestAlertPending = false;
+    _notifySafely(immediate: true);
+  }
+
   void clearError() {
     if (_error == null) {
       return;
@@ -735,6 +1116,14 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
     debugPrint('[SleepProvider] $message');
   }
 
+  String _formatDuration(Duration value) {
+    final totalSeconds = value.inSeconds.clamp(0, 99 * 3600 + 59 * 60 + 59);
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    final s = totalSeconds % 60;
+    return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+
   @override
   void dispose() {
     _isDisposed = true;
@@ -742,12 +1131,18 @@ class SleepProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     _notifyTimer?.cancel();
     _notifyTimer = null;
+    _edgeHealthTimer?.cancel();
+    _edgeHealthTimer = null;
 
     _messageSubscription?.cancel();
     _statusSubscription?.cancel();
     _cloudSubscription?.cancel();
 
     unawaited(_mqttService.dispose());
+    final edgeApi = _edgeApiService;
+    if (edgeApi != null) {
+      unawaited(edgeApi.dispose());
+    }
     unawaited(_tts.stop());
     super.dispose();
   }

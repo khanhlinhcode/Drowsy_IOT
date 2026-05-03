@@ -14,11 +14,23 @@ class ChartWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     if (data.isEmpty) {
       return Center(
-        child: Text(
-          'Waiting for incoming data...',
-          style: Theme.of(
-            context,
-          ).textTheme.bodyMedium?.copyWith(color: Colors.white70),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              Icons.show_chart_rounded,
+              size: 36,
+              color: Colors.white.withValues(alpha: 0.15),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Waiting for data...',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Colors.white.withValues(alpha: 0.30),
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
         ),
       );
     }
@@ -43,14 +55,16 @@ class ChartWidget extends StatelessWidget {
 
     return Column(
       children: <Widget>[
+        // Legend
         Row(
           children: <Widget>[
-            _LegendDot(color: const Color(0xFFFB7185), label: 'State'),
-            const SizedBox(width: 14),
-            _LegendDot(color: const Color(0xFF7DD3FC), label: 'Confidence'),
+            _LegendDot(color: const Color(0xFFF87171), label: 'State'),
+            const SizedBox(width: 16),
+            _LegendDot(color: const Color(0xFF60A5FA), label: 'Confidence'),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 12),
+        // Chart
         Expanded(
           child: LineChart(
             LineChartData(
@@ -66,8 +80,9 @@ class ChartWidget extends StatelessWidget {
                 horizontalInterval: 0.5,
                 getDrawingHorizontalLine: (_) {
                   return FlLine(
-                    color: Colors.white.withValues(alpha: 0.14),
-                    strokeWidth: 1,
+                    color: Colors.white.withValues(alpha: 0.06),
+                    strokeWidth: 0.8,
+                    dashArray: <int>[4, 4],
                   );
                 },
               ),
@@ -76,7 +91,10 @@ class ChartWidget extends StatelessWidget {
                 touchTooltipData: LineTouchTooltipData(
                   fitInsideHorizontally: true,
                   fitInsideVertically: true,
-                  tooltipPadding: const EdgeInsets.all(10),
+                  tooltipPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
                   getTooltipItems: (touchedSpots) {
                     return touchedSpots
                         .map((spot) {
@@ -92,11 +110,12 @@ class ChartWidget extends StatelessWidget {
                           );
 
                           return LineTooltipItem(
-                            '${model.state.label} | ${(model.confidence * 100).toStringAsFixed(0)}% | $hh:$mm',
+                            '${model.state.label}  ${(model.confidence * 100).toStringAsFixed(0)}%  $hh:$mm',
                             const TextStyle(
                               color: Colors.white,
-                              fontSize: 12,
+                              fontSize: 11,
                               fontWeight: FontWeight.w600,
+                              letterSpacing: 0.2,
                             ),
                           );
                         })
@@ -114,16 +133,16 @@ class ChartWidget extends StatelessWidget {
                 leftTitles: AxisTitles(
                   sideTitles: SideTitles(
                     showTitles: true,
-                    reservedSize: 60,
+                    reservedSize: 54,
                     interval: 0.5,
                     getTitlesWidget: (value, meta) {
                       return Padding(
-                        padding: const EdgeInsets.only(right: 8),
+                        padding: const EdgeInsets.only(right: 6),
                         child: Text(
                           _leftLabel(value),
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.35),
+                            fontSize: 10,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
@@ -134,7 +153,7 @@ class ChartWidget extends StatelessWidget {
                 bottomTitles: AxisTitles(
                   sideTitles: SideTitles(
                     showTitles: true,
-                    reservedSize: 30,
+                    reservedSize: 26,
                     interval: _bottomInterval(plottedData.length),
                     getTitlesWidget: (value, meta) {
                       final index = value.toInt();
@@ -146,12 +165,15 @@ class ChartWidget extends StatelessWidget {
                       final hh = time.hour.toString().padLeft(2, '0');
                       final mm = time.minute.toString().padLeft(2, '0');
 
-                      return Text(
-                        '$hh:$mm',
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w500,
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          '$hh:$mm',
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.30),
+                            fontSize: 9,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       );
                     },
@@ -159,10 +181,11 @@ class ChartWidget extends StatelessWidget {
                 ),
               ),
               lineBarsData: <LineChartBarData>[
+                // State line
                 LineChartBarData(
                   isCurved: true,
                   curveSmoothness: 0.22,
-                  barWidth: 3.5,
+                  barWidth: 2.5,
                   isStrokeCapRound: true,
                   spots: stateSpots,
                   dotData: const FlDotData(show: false),
@@ -171,8 +194,8 @@ class ChartWidget extends StatelessWidget {
                     end: Alignment.centerRight,
                     colors: <Color>[
                       Color(0xFF34D399),
-                      Color(0xFFF97316),
-                      Color(0xFFFB7185),
+                      Color(0xFFFBBF24),
+                      Color(0xFFF87171),
                     ],
                   ),
                   belowBarData: BarAreaData(
@@ -181,20 +204,31 @@ class ChartWidget extends StatelessWidget {
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
                       colors: <Color>[
-                        const Color(0xFFFB7185).withValues(alpha: 0.30),
-                        const Color(0xFF0F172A).withValues(alpha: 0.03),
+                        const Color(0xFFF87171).withValues(alpha: 0.15),
+                        const Color(0xFF0F172A).withValues(alpha: 0.0),
                       ],
                     ),
                   ),
                 ),
+                // Confidence line
                 LineChartBarData(
                   isCurved: true,
                   curveSmoothness: 0.18,
-                  barWidth: 2.4,
+                  barWidth: 1.8,
                   spots: confidenceSpots,
-                  color: const Color(0xFF7DD3FC),
+                  color: const Color(0xFF60A5FA).withValues(alpha: 0.65),
                   dotData: const FlDotData(show: false),
-                  belowBarData: BarAreaData(show: false),
+                  belowBarData: BarAreaData(
+                    show: true,
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: <Color>[
+                        const Color(0xFF60A5FA).withValues(alpha: 0.08),
+                        const Color(0xFF60A5FA).withValues(alpha: 0.0),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -270,13 +304,13 @@ class ChartWidget extends StatelessWidget {
 
   static String _leftLabel(double value) {
     if ((value - 0).abs() < 0.01) {
-      return '0 Normal';
+      return 'Normal';
     }
     if ((value - 0.5).abs() < 0.01) {
-      return '0.5 Sleepy';
+      return 'Sleepy';
     }
     if ((value - 1).abs() < 0.01) {
-      return '1 Sleep';
+      return 'Sleep';
     }
     return '';
   }
@@ -295,6 +329,9 @@ class ChartWidget extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Legend Dot
+// ─────────────────────────────────────────────────────────────────────────────
 class _LegendDot extends StatelessWidget {
   const _LegendDot({required this.color, required this.label});
 
@@ -304,18 +341,29 @@ class _LegendDot extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Row(
+      mainAxisSize: MainAxisSize.min,
       children: <Widget>[
         Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            boxShadow: <BoxShadow>[
+              BoxShadow(
+                color: color.withValues(alpha: 0.40),
+                blurRadius: 4,
+              ),
+            ],
+          ),
         ),
         const SizedBox(width: 6),
         Text(
           label,
           style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: Colors.white70,
+            color: Colors.white.withValues(alpha: 0.50),
             fontWeight: FontWeight.w600,
+            fontSize: 11,
           ),
         ),
       ],

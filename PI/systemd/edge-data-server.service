@@ -1,0 +1,29 @@
+[Unit]
+Description=Drowsy Edge Data Server (HTTP ingest + app feed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+Environment=PYTHONUNBUFFERED=1
+Environment=EDGE_SERVER_HOST=__EDGE_SERVER_HOST__
+Environment=EDGE_SERVER_PORT=__EDGE_SERVER_PORT__
+Environment=EDGE_SERVER_DB=__EDGE_SERVER_DB__
+Environment=EDGE_SERVER_TOKEN=__EDGE_SERVER_TOKEN__
+Environment=EDGE_SERVER_INGEST_TOKEN=__EDGE_SERVER_INGEST_TOKEN__
+Environment=EDGE_SERVER_READ_TOKEN=__EDGE_SERVER_READ_TOKEN__
+Environment=EDGE_SERVER_CORS_ORIGIN=__EDGE_SERVER_CORS_ORIGIN__
+ExecStart=__PYTHON_BIN__ __WORKDIR__/edge_data_server.py
+Restart=always
+RestartSec=2
+TimeoutStartSec=15
+TimeoutStopSec=10
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

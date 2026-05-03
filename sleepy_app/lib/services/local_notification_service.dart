@@ -49,9 +49,9 @@ class LocalNotificationService {
     String? dedupKey,
   }) {
     return _showAlert(
-      title: 'Drowsiness Warning',
+      title: 'Drowsiness Warning / Cảnh báo buồn ngủ',
       body:
-          'Sleepy state detected (${(confidence * 100).clamp(0, 100).toStringAsFixed(0)}%). Please stay alert.',
+          'Sleepy state detected (${(confidence * 100).clamp(0, 100).toStringAsFixed(0)}%). Please stay alert. / Phát hiện buồn ngủ, vui lòng tập trung lái xe.',
       eventTimestampMs: eventTimestampMs,
       dedupKey: dedupKey,
       threadIdentifier: 'sleepy_alerts',
@@ -60,16 +60,41 @@ class LocalNotificationService {
 
   Future<void> showSleepAlert({
     required double confidence,
+    String? statusLabel,
+    int? fatigue,
     int? eventTimestampMs,
     String? dedupKey,
   }) {
+    final statusText = (statusLabel == null || statusLabel.trim().isEmpty)
+        ? ''
+        : ' Status/Trạng thái: ${statusLabel.trim().toUpperCase()}.';
+    final fatigueText = fatigue == null
+        ? ''
+        : ' Fatigue/Mệt mỏi: ${fatigue.clamp(0, 100)}.';
     return _showAlert(
-      title: 'Drowsiness Alert',
+      title: 'Drowsiness Alert / Cảnh báo ngủ gật',
       body:
-          'Sleep detected (${(confidence * 100).clamp(0, 100).toStringAsFixed(0)}% confidence). Please take action immediately.',
+          'Sleep detected (${(confidence * 100).clamp(0, 100).toStringAsFixed(0)}% confidence).$statusText$fatigueText Please take action immediately. / Phát hiện ngủ gật, hãy dừng xe an toàn ngay.',
       eventTimestampMs: eventTimestampMs,
       dedupKey: dedupKey,
       threadIdentifier: 'sleep_alerts',
+    );
+  }
+
+  Future<void> showRestBreakAlert({
+    required int recentCount,
+    required int windowMs,
+    int? eventTimestampMs,
+    String? dedupKey,
+  }) {
+    final windowMin = (windowMs / 60000).toStringAsFixed(0);
+    return _showAlert(
+      title: 'Rest Recommendation / Khuyến nghị nghỉ ngơi',
+      body:
+          'Detected $recentCount drowsy events within $windowMin minutes. Please stop and rest. / Phát hiện nhiều lần ngủ gật trong $windowMin phút, bạn nên dừng xe và nghỉ ngơi ngay.',
+      eventTimestampMs: eventTimestampMs,
+      dedupKey: dedupKey,
+      threadIdentifier: 'rest_recommendation_alerts',
     );
   }
 

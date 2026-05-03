@@ -39,6 +39,7 @@ dependencies:
   path: ^1.9.1
   fl_chart: ^1.1.1
   mqtt_client: ^10.11.1
+  http: ^1.5.0
   flutter_local_notifications: ^19.4.2
   firebase_core: ^3.15.2
   cloud_firestore: ^5.6.11

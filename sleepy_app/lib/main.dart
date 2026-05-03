@@ -6,7 +6,7 @@ import 'package:provider/provider.dart';
 
 import 'providers/sleep_provider.dart';
 import 'screens/analytics_screen.dart';
-import 'screens/home_screen.dart';
+import 'screens/main_tabs_screen.dart';
 import 'services/auth_service.dart';
 import 'firebase_options.dart';
 
@@ -95,7 +95,7 @@ class DrowsyApp extends StatelessWidget {
             routes: <String, WidgetBuilder>{
               '/analytics': (_) => const AnalyticsScreen(),
             },
-            home: const HomeScreen(),
+            home: const MainTabsScreen(),
           ),
         );
       },
@@ -127,15 +127,85 @@ class DrowsyApp extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Boot Screen — premium loading with breathing animation
+// ─────────────────────────────────────────────────────────────────────────────
 class _BootScreen extends StatelessWidget {
   const _BootScreen();
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: <Color>[
+              Color(0xFF0A1628),
+              Color(0xFF101D35),
+              Color(0xFF162849),
+            ],
+          ),
+        ),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              // App Icon
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(18),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: <Color>[Color(0xFF3B82F6), Color(0xFF1D4ED8)],
+                  ),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: const Color(0xFF3B82F6).withValues(alpha: 0.35),
+                      blurRadius: 24,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
+                ),
+                child: const Icon(
+                  Icons.visibility_rounded,
+                  color: Colors.white,
+                  size: 36,
+                ),
+              ),
+              const SizedBox(height: 24),
+              Text(
+                'Drowsy Monitor',
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.3,
+                ),
+              ),
+              const SizedBox(height: 32),
+              SizedBox(
+                width: 28,
+                height: 28,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: Colors.white.withValues(alpha: 0.50),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Startup Error Screen
+// ─────────────────────────────────────────────────────────────────────────────
 class _StartupErrorScreen extends StatelessWidget {
   const _StartupErrorScreen({required this.message});
 
@@ -144,13 +214,58 @@ class _StartupErrorScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(
-            'Firebase initialization failed.\n\n$message',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyLarge,
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: <Color>[
+              Color(0xFF0A1628),
+              Color(0xFF101D35),
+              Color(0xFF162849),
+            ],
+          ),
+        ),
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Container(
+                    width: 56,
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFEF4444).withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.error_outline_rounded,
+                      color: Color(0xFFEF4444),
+                      size: 28,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Text(
+                    'Initialization Failed',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    message,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Colors.white.withValues(alpha: 0.55),
+                      height: 1.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -158,6 +273,9 @@ class _StartupErrorScreen extends StatelessWidget {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Login Screen — premium iOS-style authentication
+// ─────────────────────────────────────────────────────────────────────────────
 class _LoginScreen extends StatefulWidget {
   const _LoginScreen({required this.authService});
 
@@ -175,6 +293,7 @@ class _LoginScreenState extends State<_LoginScreen> {
   bool _createAccount = false;
   bool _submitting = false;
   String? _error;
+  bool _obscurePassword = true;
 
   @override
   void dispose() {
@@ -223,6 +342,68 @@ class _LoginScreenState extends State<_LoginScreen> {
     }
   }
 
+  InputDecoration _inputDecoration({
+    required String label,
+    required String hint,
+    required IconData prefixIcon,
+    Widget? suffixIcon,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      hintStyle: TextStyle(
+        color: Colors.white.withValues(alpha: 0.25),
+        fontSize: 14,
+      ),
+      labelStyle: TextStyle(
+        color: Colors.white.withValues(alpha: 0.55),
+        fontSize: 14,
+        fontWeight: FontWeight.w500,
+      ),
+      prefixIcon: Icon(
+        prefixIcon,
+        color: Colors.white.withValues(alpha: 0.40),
+        size: 20,
+      ),
+      suffixIcon: suffixIcon,
+      filled: true,
+      fillColor: Colors.white.withValues(alpha: 0.06),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(
+          color: Colors.white.withValues(alpha: 0.10),
+        ),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(
+          color: Colors.white.withValues(alpha: 0.10),
+        ),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(
+          color: Color(0xFF3B82F6),
+          width: 1.5,
+        ),
+      ),
+      errorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(
+          color: const Color(0xFFEF4444).withValues(alpha: 0.50),
+        ),
+      ),
+      focusedErrorBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(
+          color: Color(0xFFEF4444),
+          width: 1.5,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -232,134 +413,310 @@ class _LoginScreenState extends State<_LoginScreen> {
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: <Color>[
-              Color(0xFF0D2435),
-              Color(0xFF162C46),
-              Color(0xFF203A57),
+              Color(0xFF0A1628),
+              Color(0xFF101D35),
+              Color(0xFF162849),
             ],
           ),
         ),
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.symmetric(horizontal: 24),
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: Card(
-                  color: Colors.white.withValues(alpha: 0.10),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    side: BorderSide(
-                      color: Colors.white.withValues(alpha: 0.30),
-                    ),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 22, 20, 20),
-                    child: Form(
-                      key: _formKey,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: <Widget>[
-                          Text(
-                            _createAccount ? 'Create Account' : 'Sign In',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.headlineSmall
-                                ?.copyWith(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Login is required to access realtime monitoring.',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall
-                                ?.copyWith(color: Colors.white70),
-                          ),
-                          const SizedBox(height: 18),
-                          TextFormField(
-                            controller: _emailController,
-                            keyboardType: TextInputType.emailAddress,
-                            autofillHints: const <String>[AutofillHints.email],
-                            decoration: const InputDecoration(
-                              labelText: 'Email',
-                              border: OutlineInputBorder(),
-                            ),
-                            validator: (value) {
-                              final text = value?.trim() ?? '';
-                              if (text.isEmpty) {
-                                return 'Email is required.';
-                              }
-                              if (!text.contains('@')) {
-                                return 'Enter a valid email.';
-                              }
-                              return null;
-                            },
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: _passwordController,
-                            obscureText: true,
-                            autofillHints: const <String>[
-                              AutofillHints.password,
-                            ],
-                            decoration: const InputDecoration(
-                              labelText: 'Password',
-                              border: OutlineInputBorder(),
-                            ),
-                            validator: (value) {
-                              final text = value ?? '';
-                              if (text.length < 6) {
-                                return 'Password must be at least 6 characters.';
-                              }
-                              return null;
-                            },
-                          ),
-                          if (_error != null) ...<Widget>[
-                            const SizedBox(height: 10),
-                            Text(
-                              _error!,
-                              textAlign: TextAlign.center,
-                              style: Theme.of(context).textTheme.bodySmall
-                                  ?.copyWith(color: const Color(0xFFFFD1D1)),
-                            ),
+                constraints: const BoxConstraints(maxWidth: 400),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    // ── App Icon ─────────────────────────────────────
+                    Container(
+                      width: 72,
+                      height: 72,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(18),
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: <Color>[
+                            Color(0xFF3B82F6),
+                            Color(0xFF1D4ED8),
                           ],
-                          const SizedBox(height: 16),
-                          FilledButton(
-                            onPressed: _submitting ? null : _submit,
-                            child: _submitting
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : Text(
-                                    _createAccount
-                                        ? 'Create Account'
-                                        : 'Sign In',
-                                  ),
-                          ),
-                          const SizedBox(height: 8),
-                          TextButton(
-                            onPressed: _submitting
-                                ? null
-                                : () {
-                                    setState(() {
-                                      _createAccount = !_createAccount;
-                                      _error = null;
-                                    });
-                                  },
-                            child: Text(
-                              _createAccount
-                                  ? 'Have an account? Sign in'
-                                  : 'Need an account? Create one',
-                            ),
+                        ),
+                        boxShadow: <BoxShadow>[
+                          BoxShadow(
+                            color: const Color(0xFF3B82F6)
+                                .withValues(alpha: 0.30),
+                            blurRadius: 28,
+                            offset: const Offset(0, 10),
                           ),
                         ],
                       ),
+                      child: const Icon(
+                        Icons.visibility_rounded,
+                        color: Colors.white,
+                        size: 36,
+                      ),
                     ),
-                  ),
+                    const SizedBox(height: 28),
+
+                    // ── Title ────────────────────────────────────────
+                    Text(
+                      'Drowsy Monitor',
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: -0.5,
+                          ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Hệ thống giám sát buồn ngủ thời gian thực',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Colors.white.withValues(alpha: 0.45),
+                        fontWeight: FontWeight.w500,
+                        letterSpacing: 0.1,
+                      ),
+                    ),
+                    const SizedBox(height: 36),
+
+                    // ── Form Card ────────────────────────────────────
+                    Container(
+                      padding: const EdgeInsets.all(24),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(22),
+                        color: Colors.white.withValues(alpha: 0.05),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      child: Form(
+                        key: _formKey,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: <Widget>[
+                            // Section header
+                            Text(
+                              _createAccount
+                                  ? 'Create Account'
+                                  : 'Welcome Back',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .titleMedium
+                                  ?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _createAccount
+                                  ? 'Tạo tài khoản để bắt đầu giám sát'
+                                  : 'Đăng nhập để tiếp tục',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                    color: Colors.white.withValues(alpha: 0.40),
+                                  ),
+                            ),
+                            const SizedBox(height: 24),
+
+                            // Email
+                            TextFormField(
+                              controller: _emailController,
+                              keyboardType: TextInputType.emailAddress,
+                              autofillHints: const <String>[
+                                AutofillHints.email,
+                              ],
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w500,
+                              ),
+                              decoration: _inputDecoration(
+                                label: 'Email',
+                                hint: 'your@email.com',
+                                prefixIcon: Icons.mail_outline_rounded,
+                              ),
+                              validator: (value) {
+                                final text = value?.trim() ?? '';
+                                if (text.isEmpty) {
+                                  return 'Email is required.';
+                                }
+                                if (!text.contains('@')) {
+                                  return 'Enter a valid email.';
+                                }
+                                return null;
+                              },
+                            ),
+                            const SizedBox(height: 14),
+
+                            // Password
+                            TextFormField(
+                              controller: _passwordController,
+                              obscureText: _obscurePassword,
+                              autofillHints: const <String>[
+                                AutofillHints.password,
+                              ],
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w500,
+                              ),
+                              decoration: _inputDecoration(
+                                label: 'Password',
+                                hint: '••••••',
+                                prefixIcon: Icons.lock_outline_rounded,
+                                suffixIcon: IconButton(
+                                  onPressed: () {
+                                    setState(() {
+                                      _obscurePassword = !_obscurePassword;
+                                    });
+                                  },
+                                  icon: Icon(
+                                    _obscurePassword
+                                        ? Icons.visibility_off_rounded
+                                        : Icons.visibility_rounded,
+                                    color:
+                                        Colors.white.withValues(alpha: 0.35),
+                                    size: 20,
+                                  ),
+                                ),
+                              ),
+                              validator: (value) {
+                                final text = value ?? '';
+                                if (text.length < 6) {
+                                  return 'Password must be at least 6 characters.';
+                                }
+                                return null;
+                              },
+                            ),
+
+                            // Error
+                            AnimatedSize(
+                              duration: const Duration(milliseconds: 240),
+                              curve: Curves.easeOutCubic,
+                              child: _error != null
+                                  ? Padding(
+                                      padding: const EdgeInsets.only(top: 14),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 14,
+                                          vertical: 10,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFFEF4444)
+                                              .withValues(alpha: 0.10),
+                                          borderRadius:
+                                              BorderRadius.circular(10),
+                                          border: Border.all(
+                                            color: const Color(0xFFEF4444)
+                                                .withValues(alpha: 0.20),
+                                          ),
+                                        ),
+                                        child: Row(
+                                          children: <Widget>[
+                                            Icon(
+                                              Icons.info_outline_rounded,
+                                              color: const Color(0xFFEF4444)
+                                                  .withValues(alpha: 0.70),
+                                              size: 16,
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Expanded(
+                                              child: Text(
+                                                _error!,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .bodySmall
+                                                    ?.copyWith(
+                                                      color: const Color(
+                                                          0xFFFFB4B4),
+                                                      fontWeight:
+                                                          FontWeight.w500,
+                                                    ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    )
+                                  : const SizedBox.shrink(),
+                            ),
+                            const SizedBox(height: 22),
+
+                            // Submit button
+                            SizedBox(
+                              height: 50,
+                              child: FilledButton(
+                                onPressed: _submitting ? null : _submit,
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: const Color(0xFF3B82F6),
+                                  disabledBackgroundColor:
+                                      const Color(0xFF3B82F6)
+                                          .withValues(alpha: 0.40),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  elevation: 0,
+                                ),
+                                child: _submitting
+                                    ? const SizedBox(
+                                        width: 20,
+                                        height: 20,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                    : Text(
+                                        _createAccount
+                                            ? 'Create Account'
+                                            : 'Sign In',
+                                        style: const TextStyle(
+                                          fontSize: 15,
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: 0.2,
+                                        ),
+                                      ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+
+                    // ── Toggle ───────────────────────────────────────
+                    TextButton(
+                      onPressed: _submitting
+                          ? null
+                          : () {
+                              setState(() {
+                                _createAccount = !_createAccount;
+                                _error = null;
+                              });
+                            },
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                      ),
+                      child: Text(
+                        _createAccount
+                            ? 'Already have an account? Sign in'
+                            : 'Don\'t have an account? Create one',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF60A5FA),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                  ],
                 ),
               ),
             ),
