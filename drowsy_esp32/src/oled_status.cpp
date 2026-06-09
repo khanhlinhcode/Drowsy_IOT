@@ -401,8 +401,8 @@ void OledStatusDisplay::drawCalibration(uint32_t nowMs, const OledStatusSnapshot
   drawEyeIcon(gOled, 108, 22, !eyeBlink);
 
   // ─── Timer text ───
-  uint32_t remainSec = ((100 - pct) * 30) / 100;
-  if (remainSec > 30) remainSec = 30;
+  uint32_t remainSec = ((100 - pct) * 5) / 100;
+  if (remainSec > 5) remainSec = 5;
   gOled->setCursor(24, 34);
   gOled->print("Con lai: ");
   gOled->print(static_cast<int>(remainSec));
@@ -594,7 +594,7 @@ void OledStatusDisplay::drawFrame(uint32_t nowMs, const OledStatusSnapshot& snap
     int spinnerX = ((nowMs / 50) % 108);
     gOled->fillRect(spinnerX, 58, 20, 4, OLED_TEXT_COLOR);
   } else {
-    // Calibration: look straight 30s
+    // Calibration: look straight 5s
     drawCalibration(nowMs, snapshot, pct);
   }
 

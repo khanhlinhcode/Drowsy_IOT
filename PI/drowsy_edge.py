@@ -720,7 +720,7 @@ STATUS_VOTE_WINDOW = 3
 INFER_INTERVAL_MAX_MS = 160
 FAST_RECOVERY_MS = 300
 FAST_RECOVERY_FATIGUE = 60.0
-ATTENTIVE_ARM_MS = 30000
+ATTENTIVE_ARM_MS = 5000
 # Keep only short tolerance for natural blinks; large grace causes early arm
 # after repeated micro-breaks across multiple attempts.
 ATTENTIVE_BREAK_GRACE_MS = int(os.getenv("ATTENTIVE_BREAK_GRACE_MS", "700"))
@@ -1180,7 +1180,7 @@ def _update_no_face_arm_reset(now_ms, face_present):
     _status_vote.clear()
     print(
         f"[ARM] NO FACE {int(NO_FACE_REARM_MS / 1000)}s -> disarmed, "
-        "require 30s face-forward again"
+        "require 5s face-forward again"
     )
     _no_face_since_ms = now_ms
     return True
@@ -2162,10 +2162,10 @@ def process_frame(frame):
             if (ts - _face_lock_since_ms) >= ARM_FACE_LOCK_MS:
                 if _attentive_since_ms == 0:
                     _attentive_since_ms = ts
-                    print("[ARM] face lock -> start 30s countdown")
+                    print("[ARM] face lock -> start 5s countdown")
                 elif (ts - _attentive_since_ms) >= ATTENTIVE_ARM_MS:
                     _drowsy_armed = True
-                    print("[ARM] face present 30s -> drowsy detection enabled")
+                    print("[ARM] face present 5s -> drowsy detection enabled")
         else:
             _face_lock_since_ms = 0
             if _attentive_since_ms != 0:
@@ -3008,7 +3008,7 @@ def main():
         print(f"WiFi lock mode={'ON (ESP32 SSID only)' if WIFI_LOCK_TO_ESP32 else 'OFF'}")
     else:
         print("WiFi sync mode=EXTERNAL daemon (esp32_wifi_bridge.py)")
-    print(f"Pi arm gate={'ON(30s)' if PI_ARM_GATE_ENABLED else 'OFF (ESP32 handles 30s gate)'}")
+    print(f"Pi arm gate={'ON(5s)' if PI_ARM_GATE_ENABLED else 'OFF (ESP32 handles 5s gate)'}")
     print(f"Preview={'ON' if args.preview else 'OFF (headless)'}")
 
     try:

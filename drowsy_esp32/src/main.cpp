@@ -78,15 +78,15 @@ const uint32_t CONFIRMED_STATE_HOLD_MS = 180;
 const uint32_t SLEEP_CONTINUOUS_MIN_MS = 0;  // Alert follows realtime state immediately.
 // Hard timeout — force reset dangerous state when MQTT is dead for >30s.
 const uint32_t WATCHDOG_HARD_TIMEOUT_MS = 30000;
-const uint32_t DRIVING_CONFIRM_LOOK_STRAIGHT_MS = 30000;  // 30s face-forward to arm
-// Short grace only for blink-level interruptions; prevents "early" 30s arm
+const uint32_t DRIVING_CONFIRM_LOOK_STRAIGHT_MS = 5000;  // 5s face-forward to arm
+// Short grace only for blink-level interruptions; prevents "early" 5s arm
 // on repeated attempts after short look-away events.
 const uint32_t DRIVING_CONFIRM_BREAK_GRACE_MS = 700;
 const uint32_t DRIVING_CONFIRM_BREAK_RESET_MS = 12000;
 const uint8_t DRIVING_ARM_MAX_FATIGUE = 50;               // FIX: 35→50 — allow arming with moderate fatigue
 const uint32_t DRIVING_ARM_FATIGUE_GRACE_MS = 1200;       // FIX: 800→1200ms network jitter tolerance
 // Fallback: if Pi keeps arm=0 while telemetry is healthy,
-// switch quickly to local 30s gate so arming is not blocked indefinitely.
+// switch quickly to local 5s gate so arming is not blocked indefinitely.
 const uint32_t PI_ARM_FALSE_FALLBACK_MS = 2000;
 const bool ENABLE_DRIVING_ARM_GATE = true;
 const bool FOLLOW_PI_ARM_GATE = true;
@@ -1137,7 +1137,7 @@ void updateDrivingArmGate(uint32_t nowMs) {
     return;
   }
   // Follow Pi arm gate when Pi provides "armed" metadata.
-  // This guarantees arm timing comes from Pi's forward-face 30s logic only.
+  // This guarantees arm timing comes from Pi's forward-face 5s logic only.
   if (FOLLOW_PI_ARM_GATE && gPiArmedKnown) {
     // Pi arm gate: source-of-truth.
     const uint32_t armFreshMs = max(gCurrentTtlMs, static_cast<uint32_t>(6000));
@@ -1210,7 +1210,7 @@ void updateDrivingArmGate(uint32_t nowMs) {
     gAttentivePauseAccumMs = 0;
     gAttentiveBreakSinceMs = 0;
     gLastArmProgressLogMs = nowMs;
-    Serial.println("[DRIVE] attentive window start (need 30s)");
+    Serial.println("[DRIVE] attentive window start (need 5s)");
     return;
   }
 
@@ -1231,7 +1231,7 @@ void updateDrivingArmGate(uint32_t nowMs) {
     uint32_t elapsedSec = effectiveMs / 1000;
     Serial.print("[DRIVE] attentive progress ");
     Serial.print(elapsedSec);
-    Serial.println("s/30s");
+    Serial.println("s/5s");
     gLastArmProgressLogMs = nowMs;
   }
 
@@ -1245,7 +1245,7 @@ void updateDrivingArmGate(uint32_t nowMs) {
   gAttentivePauseAccumMs = 0;
   gAttentiveBreakSinceMs = 0;
   gLastArmProgressLogMs = 0;
-  Serial.println("[DRIVE] attentive 30s confirmed -> drowsy detection armed");
+  Serial.println("[DRIVE] attentive 5s confirmed -> drowsy detection armed");
 }
 
 bool isAttentiveForDrivingArm(uint32_t nowMs) {
@@ -1255,12 +1255,12 @@ bool isAttentiveForDrivingArm(uint32_t nowMs) {
   if (gStartupActive) return false;
 
   // When Pi arm gate is active and known, the Pi branch in updateDrivingArmGate()
-  // handles everything — the local 30s gate is not used in parallel.
+  // handles everything — the local 5s gate is not used in parallel.
   if (FOLLOW_PI_ARM_GATE && gPiArmedKnown && !gPiArmFallbackActive) {
     return false;  // Pi branch handles this; local gate must NOT run simultaneously.
   }
 
-  // LOCAL 30s GATE — used in two cases:
+  // LOCAL 5s GATE — used in two cases:
   //   1. Pi never connected (true standalone mode).
   //   2. Pi connected but never sent armed metadata (old Pi firmware).
   const bool hasMqttData = gMqttUp && gFirstPacketReceived &&
@@ -2196,7 +2196,7 @@ void setup() {
   if (!ENABLE_DRIVING_ARM_GATE) {
     Serial.println("[CFG] Driving arm gate=OFF (Pi state drives alert directly)");
   } else {
-    Serial.println("[CFG] Driving arm gate=ON (30s attentive required)");
+    Serial.println("[CFG] Driving arm gate=ON (5s attentive required)");
   }
   Serial.print("[CFG] Startup beep on boot=");
   Serial.println(ENABLE_STARTUP_BEEP_ON_BOOT ? "ON" : "OFF");
